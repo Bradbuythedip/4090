@@ -1,5 +1,5 @@
-# brute_force_puzzle68.py
-# Systematically searches the entire 68-bit key space for Bitcoin Puzzle #68
+# brute_force_puzzle68_fixed.py
+# Systematically searches the correct 68-bit key space for Bitcoin Puzzle #68
 
 import hashlib
 import binascii
@@ -31,6 +31,10 @@ PHI = mpf('1.6180339887498948482045868343656381177203091798057628621354486227052
 TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubKey
 PUZZLE_NUMBER = 68
 PHI_OVER_8 = float(PHI / 8)  # Convert to float for GPU compatibility
+
+# CORRECT 68-bit key range
+MIN_68BIT = 1 << 67  # 0x80000000000000000 (bit 67 set, exactly 68 bits)
+MAX_68BIT = (1 << 68) - 1  # 0xffffffffffffffff (all 68 bits set)
 
 # CUDA kernel for testing keys
 CUDA_CODE = """
@@ -297,32 +301,41 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
             ctx.pop()
             return None
         
-        # Calculate key space boundaries
-        max_68bit = (1 << 68) - 1  # Maximum 68-bit value
+        # Calculate key space boundaries - FIXED
         if start_key is None:
             # Try to load last position from progress file
             if os.path.exists("puzzle68_brute_force_progress.txt"):
                 try:
                     with open("puzzle68_brute_force_progress.txt", "r") as f:
                         start_key = int(f.readline().strip(), 16)
+                        # Make sure it's in range
+                        if start_key < MIN_68BIT:
+                            print(f"Loaded start key {format_private_key(start_key)} is below the 68-bit range.")
+                            print(f"Setting to minimum 68-bit value: {format_private_key(MIN_68BIT)}")
+                            start_key = MIN_68BIT
                         print(f"Resuming from key: {format_private_key(start_key)}")
                 except:
-                    print("Could not read progress file, starting from 0")
-                    start_key = 0
+                    print("Could not read progress file, starting from minimum 68-bit value")
+                    start_key = MIN_68BIT
             else:
-                start_key = 0
+                start_key = MIN_68BIT
         
-        if start_key > max_68bit:
+        if start_key < MIN_68BIT:
+            print(f"Start key is below the 68-bit range. Setting to minimum 68-bit value.")
+            start_key = MIN_68BIT
+        
+        if start_key > MAX_68BIT:
             print(f"Start key exceeds 68-bit range. Setting to maximum 68-bit value.")
-            start_key = max_68bit
+            start_key = MAX_68BIT
         
         print(f"Starting search at key: {format_private_key(start_key)}")
-        print(f"Maximum 68-bit key: {format_private_key(max_68bit)}")
+        print(f"Minimum 68-bit key: {format_private_key(MIN_68BIT)}")
+        print(f"Maximum 68-bit key: {format_private_key(MAX_68BIT)}")
         
         # Calculate total search space and progress
-        total_space = max_68bit + 1  # Total number of 68-bit keys
-        search_space_left = max_68bit - start_key + 1
-        progress_pct = (1 - (search_space_left / total_space)) * 100
+        total_space = MAX_68BIT - MIN_68BIT + 1  # Total number of 68-bit keys
+        search_space_left = MAX_68BIT - start_key + 1
+        progress_pct = ((start_key - MIN_68BIT) / total_space) * 100
         print(f"Total search space: {format_large_int(total_space)} keys")
         print(f"Search space remaining: {format_large_int(search_space_left)} keys")
         print(f"Progress: {progress_pct:.8f}%")
@@ -348,11 +361,11 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
         
         try:
             # Process batches until we reach the end of 68-bit range
-            while current_key <= max_68bit:
+            while current_key <= MAX_68BIT:
                 batch_start_time = time.time()
                 
                 # Calculate actual batch size (might be smaller near the end)
-                current_batch_size = min(batch_size, max_68bit - current_key + 1)
+                current_batch_size = min(batch_size, MAX_68BIT - current_key + 1)
                 
                 # Split the current key into high and low parts
                 current_key_high = current_key >> 32
@@ -405,8 +418,8 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
                     f.write(format_private_key(current_key) + "\n")
                 
                 # Calculate progress
-                search_space_left = max_68bit - current_key + 1
-                progress_pct = (1 - (search_space_left / total_space)) * 100
+                search_space_left = MAX_68BIT - current_key + 1
+                progress_pct = ((current_key - MIN_68BIT) / total_space) * 100
                 
                 print(f"\nBatch completed in {format_time(batch_time)}")
                 print(f"Current key: {format_private_key(current_key)}")
@@ -450,8 +463,8 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
                         if offset < current_batch_size:  # Make sure offset is valid
                             full_key_int = batch_base_key + offset
                             
-                            # Ensure it's exactly 68 bits
-                            if count_bits(full_key_int) != 68:
+                            # Ensure it's in the 68-bit range
+                            if full_key_int < MIN_68BIT or full_key_int > MAX_68BIT:
                                 continue
                             
                             # Format and verify
@@ -549,12 +562,13 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
 
 def main():
     """Main function"""
-    print("Brute Force Bitcoin Puzzle #68 Solver")
+    print("Brute Force Bitcoin Puzzle #68 Solver (FIXED)")
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
     print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
     print(f"Target ratio: φ/8 = {PHI_OVER_8}")
     print(f"Searching for private keys with EXACTLY 68 bits")
+    print(f"Key range: {format_private_key(MIN_68BIT)} to {format_private_key(MAX_68BIT)}")
     
     # Check whether we can use CUDA
     if not HAS_CUDA:
@@ -563,7 +577,7 @@ def main():
     
     try:
         # Run the brute force search
-        print("\nStarting brute force search of 68-bit key space...")
+        print("\nStarting brute force search of correct 68-bit key space...")
         print("Press Ctrl+C to pause (progress will be saved)")
         
         solution = brute_force_search()
