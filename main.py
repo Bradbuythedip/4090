@@ -788,8 +788,10 @@ def multi_gpu_search(num_gpus=6):
     # Check for RTX 4090s
     for i in range(available_gpus):
         device = cuda.Device(i)
+        ctx = device.make_context()
         props = device.get_attributes()
-        free_mem, total_mem = device.get_memory_info()
+        free_mem, total_mem = cuda.mem_get_info()  # Correct way to get memory info
+        ctx.pop()  # Release context
         print(f"GPU {i}: {device.name()} - {total_mem/(1024**3):.1f} GB VRAM")
         
         # If we detect RTX 4090, we can use larger batch sizes
@@ -802,7 +804,7 @@ def multi_gpu_search(num_gpus=6):
     # Create workers
     workers = []
     
-    # Start a worker for each GPU
+    # Create a worker for each GPU
     for space in search_spaces:
         gpu_id = space['gpu_id']
         base_pattern = space['base_pattern']
