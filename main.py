@@ -30,7 +30,7 @@ mp.dps = 1000  # 1000 decimal places of precision
 PHI = mpf('1.6180339887498948482045868343656381177203091798057628621354486227052604628189')
 TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubKey: 76a914e0b8a2baee1b77fc703455f39d51477451fc8cfc88ac
 PUZZLE_NUMBER = 68
-PHI_OVER_8 = float(PHI / 8)  # Convert to float for GPU compatibility
+PHI_OVER_8 = float(PHI / 8)  # Convert to float or GPU compatibility
 
 # Our best candidates from different approaches - focusing on cedb187f pattern as requested
 BASE_PATTERN = "00000000000000000000000000000000000000000000000cedb187f"
@@ -245,10 +245,13 @@ def release_gpu(gpu_data):
     """Release GPU resources"""
     if gpu_data and 'context' in gpu_data:
         try:
+            # Make sure the context is current before popping it
+            gpu_data['context'].push()
             gpu_data['context'].pop()
+            print(f"GPU context properly released")
         except Exception as e:
             print(f"Error releasing GPU: {e}")
-
+            
 def hash160(public_key_bytes):
     """Bitcoin's hash160 function: RIPEMD160(SHA256(data))"""
     sha256_hash = hashlib.sha256(public_key_bytes).digest()
@@ -424,36 +427,41 @@ def format_time(seconds):
         return f"{hours} hours, {minutes} minutes"
 
 def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000, max_batches=100):
-    """GPU search focusing on a specific pattern, optimized for RTX 4090"""
-    # Initialize CUDA for this process
-    cuda.init()
+    # ... existing code ...
     
-    # Convert pattern to int
-    base_int = int(base_pattern, 16)
+    try:
+        # ... existing code ...
+        return best_matches
+        
+    except Exception as e:
+        print(f"Error in GPU {gpu_id} search: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+        
+    finally:
+        # Ensure GPU resources are released even if an exception occurs
+        if gpu_data and 'context' in gpu_data:
+            try:
+                release_gpu(gpu_data)
+                print(f"GPU {gpu_id} resources released")
+            except Exception as e:
+                print(f"Error releasing GPU {gpu_id} resources: {e}")
+                
+        # Exit the process cleanly if there was an error
+        if SOLUTION_FOUND:
+            print(f"GPU {gpu_id}: Solution found, exiting")
+            return []
     
-    # Set up GPU
-    gpu_data = setup_gpu(gpu_id)
-    if not gpu_data:
-        return None
-    
-    # Rest of function remains the same...
+    # Initialize variables
+    found_solution = False
+    total_keys_checked = 0
+    best_matches = []
+    best_ratio_diff = 1.0
     
     try:
         # Make GPU context current
         gpu_data['context'].push()
-        
-        # Determine optimal batch size based on GPU memory
-        free_mem, total_mem = cuda.mem_get_info()
-        max_possible_batch = int(free_mem * 0.8 / 16)  # 16 bytes per key (estimated)
-        if batch_size > max_possible_batch:
-            batch_size = max_possible_batch
-            print(f"GPU {gpu_id}: Adjusted batch size to {batch_size:,} based on GPU memory")
-        
-        # Track best matches
-        best_matches = []
-        best_ratio_diff = 1.0
-        total_keys_checked = 0
-        found_solution = False
         
         # Split the base key
         base_high = base_int >> 32
@@ -461,6 +469,13 @@ def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000,
         
         # Clear the bits we want to explore
         base_low_masked = base_low & ~bit_mask
+        
+        # Determine optimal batch size based on GPU memory
+        free_mem, total_mem = cuda.mem_get_info()
+        max_possible_batch = int(free_mem * 0.8 / 16)  # 16 bytes per key (estimated)
+        if batch_size > max_possible_batch:
+            batch_size = max_possible_batch
+            print(f"GPU {gpu_id}: Adjusted batch size to {batch_size:,} based on GPU memory")
         
         print(f"GPU {gpu_id}: Search around: {format_private_key(base_int)}")
         print(f"GPU {gpu_id}: Bit length: {count_bits(base_int)}")
@@ -604,9 +619,10 @@ def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000,
                     # Add to result queue to signal other processes
                     RESULT_QUEUE.put((full_key, result))
                     found_solution = True
-                    SOLUTION_FOUND = True
                     
                     # Exit immediately on match
+                    with GLOBAL_LOCK:
+                        SOLUTION_FOUND = True
                     print("\nExiting program immediately with solution found.")
                     os._exit(0)
                     
@@ -660,8 +676,10 @@ def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000,
         return []
     
     finally:
-        # Release GPU
-        release_gpu(gpu_data)
+        # Ensure GPU resources are released even if an exception occurs
+        if gpu_data:
+            release_gpu(gpu_data)
+            print(f"GPU {gpu_id} resources released")
 
 def handle_exit_signal(sig, frame):
     """Handle user exit signal (Ctrl+C)"""
@@ -747,117 +765,103 @@ def generate_additional_candidates(base_pattern, num_candidates=10):
     return candidates
 
 def multi_gpu_search():
-    """Coordinate search across multiple GPUs - optimized for 6x RTX 4090"""
+    """Coordinate search across multiple GPUs - optimized for RTX 4090"""
     global RUNNING, SOLUTION_FOUND
     
     # Set up signal handler
     signal.signal(signal.SIGINT, handle_exit_signal)
     
-    # Initialize CUDA in the main process to check GPU count
-    cuda.init()
-    
-    # Count available GPUs
-    gpu_count = cuda.Device.count()
-    
-    # Don't try to pop a context if there isn't one
     try:
-        if cuda.Context.get_current() is not None:
-            cuda.Context.pop()
-    except Exception as e:
-        print(f"Note: No CUDA context to pop - {e}")
-    
-    if gpu_count == 0:
-        print("No CUDA devices found!")
-        return None
-    
-    print(f"Found {gpu_count} CUDA devices")
-    
-    # Rest of function remains the same...        return None
-    
-    print(f"Found {gpu_count} CUDA devices")
-    
-    # Rest of function remains the same...    
-    # Ideally, we have 6 RTX 4090s as specified
-    expected_gpus = 6
-    gpus_to_use = min(gpu_count, expected_gpus)
-    
-    print(f"Using {gpus_to_use} GPUs for search")
-    
-    # Generate search space for each GPU
-    gpu_search_spaces = distribute_masks_to_gpus(
-        list(range(gpus_to_use)), 
-        SEARCH_MASKS
-    )
-    
-    # Add extra candidates for any remaining GPU capacity
-    additional_candidates = generate_additional_candidates(BASE_PATTERN)
-    
-    # Create process pool for GPU workers
-    workers = []
-    
-    # Start a worker for each GPU search space
-    for i, (gpu_id, pattern, mask) in enumerate(gpu_search_spaces):
-        # Estimate batch size based on mask - larger masks need smaller batches
-        batch_size = 50000000 // (bin(mask).count('1') // 4 + 1)
+        # Initialize CUDA in the main process to check GPU count
+        cuda.init()
         
-        # Adjust batch size for RTX 4090s (24GB VRAM)
-        batch_size = min(100000000, max(10000000, batch_size))
+        # Count available GPUs
+        gpu_count = cuda.Device.count()
         
-        # Max batches depends on mask size - search longer for smaller spaces
-        max_batches = 2000 // (bin(mask).count('1') // 4 + 1)
-        max_batches = min(10000, max(100, max_batches))
+        if gpu_count == 0:
+            print("No CUDA devices found!")
+            return None
         
-        # Create worker process
-        worker = mp.Process(
-            target=gpu_search_with_pattern,
-            args=(gpu_id, pattern, mask, batch_size, max_batches)
+        print(f"Found {gpu_count} CUDA devices")
+        
+        # We're using 4 GPUs as you specified
+        expected_gpus = 4
+        gpus_to_use = min(gpu_count, expected_gpus)
+        
+        print(f"Using {gpus_to_use} GPUs for search")
+        
+        # Generate search space for each GPU
+        gpu_search_spaces = distribute_masks_to_gpus(
+            list(range(gpus_to_use)), 
+            SEARCH_MASKS
         )
-        worker.start()
-        workers.append(worker)
         
-        # Small stagger to avoid all GPUs competing for CPU at same time
-        time.sleep(1)
-    
-    # Monitor workers and check for results
-    try:
-        running = True
-        while running and not SOLUTION_FOUND:
-            running = False
-            for worker in workers:
-                if worker.is_alive():
-                    running = True
+        # Create process pool for GPU workers
+        workers = []
+        
+        # Start a worker for each GPU search space
+        for i, (gpu_id, pattern, mask) in enumerate(gpu_search_spaces):
+            # Estimate batch size based on mask - larger masks need smaller batches
+            batch_size = 50000000 // (bin(mask).count('1') // 4 + 1)
             
-            # Check if any worker found a solution
-            try:
-                result = RESULT_QUEUE.get(block=False)
-                if result:
-                    print("\nSolution found by a worker:")
-                    print(f"Key: {result[0]}")
-                    SOLUTION_FOUND = True
-                    break
-            except queue.Empty:
-                pass
+            # Adjust batch size for RTX GPUs
+            batch_size = min(100000000, max(10000000, batch_size))
             
+            # Max batches depends on mask size - search longer for smaller spaces
+            max_batches = 2000 // (bin(mask).count('1') // 4 + 1)
+            max_batches = min(10000, max(100, max_batches))
+            
+            # Create worker process
+            worker = mp.Process(
+                target=gpu_search_with_pattern,
+                args=(gpu_id, pattern, mask, batch_size, max_batches)
+            )
+            worker.start()
+            workers.append(worker)
+            
+            # Small stagger to avoid all GPUs competing for CPU at same time
             time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user, shutting down workers...")
-        RUNNING = False
-    
-    # Ensure all workers are terminated
-    for worker in workers:
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(timeout=1)
-    
-    print("\nAll GPU workers completed or terminated")
-    
-    # Report final statistics
-    with GLOBAL_LOCK:
+        
+        # Monitor workers and check for results
+        try:
+            running = True
+            while running and not SOLUTION_FOUND:
+                running = False
+                for worker in workers:
+                    if worker.is_alive():
+                        running = True
+                
+                # Check if any worker found a solution
+                try:
+                    result = RESULT_QUEUE.get(block=False)
+                    if result:
+                        print("\nSolution found by a worker:")
+                        print(f"Key: {result[0]}")
+                        SOLUTION_FOUND = True
+                        break
+                except queue.Empty:
+                    pass
+                
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user, shutting down workers...")
+            RUNNING = False
+        
+        # Ensure all workers are terminated
+        for worker in workers:
+            if worker.is_alive():
+                worker.join(timeout=1)
+                if worker.is_alive():
+                    worker.terminate()
+        
+        print("\nAll GPU workers completed or terminated")
+        
+        # Report final statistics
         end_time = time.time()
         elapsed = end_time - START_TIME
         print(f"\nSearch completed in {format_time(elapsed)}")
         print(f"Total keys checked: {KEYS_CHECKED:,}")
-        print(f"Average speed: {int(KEYS_CHECKED / elapsed):,} keys/second")
+        print(f"Average speed: {int(KEYS_CHECKED / (elapsed + 0.001)):,} keys/second")
         
         if BEST_GLOBAL_MATCHES:
             print("\nBest matches found:")
@@ -865,47 +869,23 @@ def multi_gpu_search():
                 print(f"{i+1}. Key: {key}")
                 print(f"   Ratio diff: {result.get('ratio_diff')}")
                 print(f"   Hash: {result.get('generated_hash')}")
-    
-    return None
-
-if __name__ == "__main__":
-    print("Starting Bitcoin Puzzle #68 Solver - Optimized for 6x RTX 4090")
-    print(f"Target hash: {TARGET_HASH}")
-    print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
-    print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
-    print(f"Target ratio: φ/8 = {PHI_OVER_8}")
-    print(f"Searching for private keys with EXACTLY 68 bits")
-    print(f"Base pattern: {BASE_PATTERN}")
-    
-    # Initialize CUDA once for device info
-    cuda.init()
-    
-    # Check GPU devices
-    print("\nGPU Information:")
-    device_count = cuda.Device.count()
-    print(f"Found {device_count} CUDA devices")
-
-    for i in range(device_count):
-        device = cuda.Device(i)
-        props = device.get_attributes()
         
-        # Create context properly for getting memory info
-        ctx = device.make_context()
-        free_mem, total_mem = cuda.mem_get_info()
-        ctx.pop()
+        # Make sure any CUDA contexts from the main process are cleaned up
+        try:
+            while cuda.Context.get_current() is not None:
+                cuda.Context.pop()
+        except Exception as e:
+            print(f"Error cleaning main process CUDA contexts: {e}")
+            
+        return None
         
-        print(f"GPU {i}: {device.name()}")
-        print(f"  Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
-        print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
-        print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")
-    
-    # Make sure we clean up all CUDA contexts before forking - safely
-    try:
-        while cuda.Context.get_current() is not None:
-            cuda.Context.pop()
     except Exception as e:
-        print(f"Note: Error cleaning up CUDA contexts: {e}")
-    
+        print(f"Error in multi_gpu_search: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    # REMOVE THIS DUPLICATE BLOCK:
     # Properly handle multiprocessing with CUDA
     mp.set_start_method('spawn', force=True)  # This is crucial for CUDA with multiprocessing    
     # Rest of function remains the same...    
@@ -941,4 +921,88 @@ if __name__ == "__main__":
         print(f"\nError during search: {str(e)}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+        sys.exit(1)if __name__ == "__main__":
+    try:
+        print("Starting Bitcoin Puzzle #68 Solver - Optimized for RTX 4090")
+        print(f"Target hash: {TARGET_HASH}")
+        print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
+        print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
+        print(f"Target ratio: φ/8 = {PHI_OVER_8}")
+        print(f"Searching for private keys with EXACTLY 68 bits")
+        print(f"Base pattern: {BASE_PATTERN}")
+        
+        # Initialize CUDA once for device info
+        cuda.init()
+        
+        # Check GPU devices
+        print("\nGPU Information:")
+        device_count = cuda.Device.count()
+        print(f"Found {device_count} CUDA devices")
+
+        for i in range(device_count):
+            device = cuda.Device(i)
+            props = device.get_attributes()
+            
+            # Create context properly for getting memory info
+            ctx = device.make_context()
+            free_mem, total_mem = cuda.mem_get_info()
+            ctx.pop()
+            
+            print(f"GPU {i}: {device.name()}")
+            print(f"  Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
+            print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
+            print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")
+        
+        # Make sure we clean up all CUDA contexts before forking
+        while cuda.Context.get_current() is not None:
+            cuda.Context.pop()
+        
+        # Properly handle multiprocessing with CUDA
+        mp.set_start_method('spawn', force=True)  # This is crucial for CUDA with multiprocessing
+        
+        # Display estimated runtime
+        print("\nRunning multi-GPU search optimized for RTX 4090s")
+        print("This will search the specific pattern space very efficiently")
+        print("Press Ctrl+C to gracefully stop the search\n")
+        
+        # Initialize start time
+        START_TIME = time.time()
+        
+        # Run the optimized search
+        solution = multi_gpu_search()
+        
+        elapsed_time = time.time() - START_TIME
+        print(f"\nSearch completed in {format_time(elapsed_time)}")
+        
+        if SOLUTION_FOUND:
+            print("\nSolution found! Check puzzle68_SOLVED.txt for details.")
+            sys.exit(0)
+        else:
+            print("\nNo exact solution found in the target pattern space.")
+            print("Check puzzle68_progress.txt for the best matches found so far.")
+    
+    except KeyboardInterrupt:
+        elapsed_time = time.time() - START_TIME
+        print(f"\nSearch interrupted after {format_time(elapsed_time)}")
+        print(f"Total keys checked: {KEYS_CHECKED:,}")
+        print("Check puzzle68_progress.txt for the best matches found so far.")
+    
+    except Exception as e:
+        print(f"\nError during search: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # Final cleanup of any remaining CUDA contexts
+        try:
+            while cuda.Context.get_current() is not None:
+                cuda.Context.pop()
+                print("Cleaned up a CUDA context during shutdown")
+        except Exception as e:
+            print(f"Final CUDA cleanup error: {e}")
+        
+        # Exit with appropriate status
+        if SOLUTION_FOUND:
+            sys.exit(0)
+        else:
+            sys.exit(1)
