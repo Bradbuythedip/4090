@@ -811,7 +811,9 @@ def multi_gpu_search(num_gpus=6):
         # Set batch size based on estimated GPU memory
         # RTX 4090 can handle much larger batches
         device = cuda.Device(gpu_id)
-        free_mem, total_mem = device.get_memory_info()
+        ctx = device.make_context()
+        free_mem, total_mem = cuda.mem_get_info()  # Correct way to get memory info
+        ctx.pop()  # Release context after checking
         
         # For 24GB GPUs like RTX 4090, use much larger batch sizes
         if total_mem > (20 * 1024 * 1024 * 1024):  # >20GB VRAM
@@ -910,8 +912,10 @@ if __name__ == "__main__":
     
     for i in range(device_count):
         device = cuda.Device(i)
+        ctx = device.make_context()
         props = device.get_attributes()
-        free_mem, total_mem = device.get_memory_info()
+        free_mem, total_mem = cuda.mem_get_info()  # Correct way to get memory info
+        ctx.pop()  # Release context when done
         print(f"GPU {i}: {device.name()}")
         print(f"  Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
         print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
