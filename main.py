@@ -21,7 +21,6 @@ import threading
 
 # GPU libraries
 import pycuda.driver as cuda
-import pycuda.autoinit
 from pycuda.compiler import SourceModule
 
 # Set high precision for mpmath
@@ -426,6 +425,9 @@ def format_time(seconds):
 
 def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000, max_batches=100):
     """GPU search focusing on a specific pattern, optimized for RTX 4090"""
+    # Initialize CUDA for this process
+    cuda.init()
+    
     # Convert pattern to int
     base_int = int(base_pattern, 16)
     
@@ -433,6 +435,8 @@ def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000,
     gpu_data = setup_gpu(gpu_id)
     if not gpu_data:
         return None
+    
+    # Rest of function remains the same...
     
     try:
         # Make GPU context current
@@ -749,8 +753,14 @@ def multi_gpu_search():
     # Set up signal handler
     signal.signal(signal.SIGINT, handle_exit_signal)
     
-    # Count available GPUs - don't re-initialize CUDA here
+    # Initialize CUDA in the main process to check GPU count
+    cuda.init()
+    
+    # Count available GPUs
     gpu_count = cuda.Device.count()
+    
+    # Clean up CUDA context in main process before forking
+    cuda.Context.pop()
     
     if gpu_count == 0:
         print("No CUDA devices found!")
@@ -758,6 +768,7 @@ def multi_gpu_search():
     
     print(f"Found {gpu_count} CUDA devices")
     
+    # Rest of function remains the same...    
     # Ideally, we have 6 RTX 4090s as specified
     expected_gpus = 6
     gpus_to_use = min(gpu_count, expected_gpus)
@@ -858,7 +869,7 @@ if __name__ == "__main__":
     print(f"Searching for private keys with EXACTLY 68 bits")
     print(f"Base pattern: {BASE_PATTERN}")
     
-    # Initialize CUDA once
+    # Initialize CUDA once for device info
     cuda.init()
     
     # Check GPU devices
@@ -880,9 +891,14 @@ if __name__ == "__main__":
         print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
         print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")
     
+    # Make sure we clean up all CUDA contexts before forking
+    while cuda.Context.get_current() is not None:
+        cuda.Context.pop()
+    
     # Properly handle multiprocessing with CUDA
     mp.set_start_method('spawn', force=True)  # This is crucial for CUDA with multiprocessing
     
+    # Rest of function remains the same...    
     # Display estimated runtime
     print("\nRunning multi-GPU search optimized for RTX 4090s")
     print("This will search the specific pattern space very efficiently")
