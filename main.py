@@ -759,12 +759,20 @@ def multi_gpu_search():
     # Count available GPUs
     gpu_count = cuda.Device.count()
     
-    # Clean up CUDA context in main process before forking
-    cuda.Context.pop()
+    # Don't try to pop a context if there isn't one
+    try:
+        if cuda.Context.get_current() is not None:
+            cuda.Context.pop()
+    except Exception as e:
+        print(f"Note: No CUDA context to pop - {e}")
     
     if gpu_count == 0:
         print("No CUDA devices found!")
         return None
+    
+    print(f"Found {gpu_count} CUDA devices")
+    
+    # Rest of function remains the same...        return None
     
     print(f"Found {gpu_count} CUDA devices")
     
@@ -891,13 +899,15 @@ if __name__ == "__main__":
         print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
         print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")
     
-    # Make sure we clean up all CUDA contexts before forking
-    while cuda.Context.get_current() is not None:
-        cuda.Context.pop()
+    # Make sure we clean up all CUDA contexts before forking - safely
+    try:
+        while cuda.Context.get_current() is not None:
+            cuda.Context.pop()
+    except Exception as e:
+        print(f"Note: Error cleaning up CUDA contexts: {e}")
     
     # Properly handle multiprocessing with CUDA
-    mp.set_start_method('spawn', force=True)  # This is crucial for CUDA with multiprocessing
-    
+    mp.set_start_method('spawn', force=True)  # This is crucial for CUDA with multiprocessing    
     # Rest of function remains the same...    
     # Display estimated runtime
     print("\nRunning multi-GPU search optimized for RTX 4090s")
