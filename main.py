@@ -220,7 +220,14 @@ __global__ void test_keys_aggressive(uint64_t prefix_high, uint64_t prefix_low,
 def setup_gpu(gpu_id):
     """Set up a specific GPU for computation"""
     try:
-        # Don't reinitialize CUDA here
+        # Make sure there are no leftover contexts before initializing
+        try:
+            while cuda.Context.get_current() is not None:
+                cuda.Context.pop()
+        except Exception:
+            pass
+            
+        # Initialize the device
         device = cuda.Device(gpu_id)
         context = device.make_context()
         module = SourceModule(cuda_code)
@@ -988,7 +995,7 @@ def generate_additional_candidates(base_pattern, num_candidates=10):
 
 def multi_gpu_search():
     """Coordinate search across multiple GPUs - optimized for RTX 4090"""
-    global RUNNING, SOLUTION_FOUND
+    global RUNNING, SOLUTION_FOUND, START_TIME  # Make START_TIME global here
     
     # Set up signal handler
     signal.signal(signal.SIGINT, handle_exit_signal)
@@ -1000,10 +1007,17 @@ def multi_gpu_search():
         # Count available GPUs
         gpu_count = cuda.Device.count()
         
+        # Make sure to pop any CUDA contexts here before proceeding
+        try:
+            while cuda.Context.get_current() is not None:
+                cuda.Context.pop()
+        except Exception as e:
+            print(f"Warning: {e}")
+        
         if gpu_count == 0:
             print("No CUDA devices found!")
             return None
-        
+            
         print(f"Found {gpu_count} CUDA devices")
         
         # We're using 4 GPUs as you specified
@@ -1094,8 +1108,12 @@ def multi_gpu_search():
         
         # Make sure any CUDA contexts from the main process are cleaned up
         try:
+            cuda_contexts_cleaned = 0
             while cuda.Context.get_current() is not None:
                 cuda.Context.pop()
+                cuda_contexts_cleaned += 1
+            if cuda_contexts_cleaned > 0:
+                print(f"Cleaned up {cuda_contexts_cleaned} CUDA contexts")
         except Exception as e:
             print(f"Error cleaning main process CUDA contexts: {e}")
             
@@ -1105,46 +1123,19 @@ def multi_gpu_search():
         print(f"Error in multi_gpu_search: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Clean up CUDA contexts even on error
+        try:
+            while cuda.Context.get_current() is not None:
+                cuda.Context.pop()
+                print("Cleaned a CUDA context after error")
+        except Exception as clean_error:
+            print(f"Error during error cleanup: {clean_error}")
+            
         return None
 
-    # REMOVE THIS DUPLICATE BLOCK:
-    # Properly handle multiprocessing with CUDA
-    mp.set_start_method('spawn', force=True)  # This is crucial for CUDA with multiprocessing    
-    # Rest of function remains the same...    
-    # Display estimated runtime
-    print("\nRunning multi-GPU search optimized for RTX 4090s")
-    print("This will search the specific pattern space very efficiently")
-    print("Press Ctrl+C to gracefully stop the search\n")
-    
-    # Initialize start time
-    START_TIME = time.time()
-    
-    try:
-        # Run the optimized search
-        solution = multi_gpu_search()
-        
-        elapsed_time = time.time() - START_TIME
-        print(f"\nSearch completed in {format_time(elapsed_time)}")
-        
-        if SOLUTION_FOUND:
-            print("\nSolution found! Check puzzle68_SOLVED.txt for details.")
-            sys.exit(0)
-        else:
-            print("\nNo exact solution found in the target pattern space.")
-            print("Check puzzle68_progress.txt for the best matches found so far.")
-    
-    except KeyboardInterrupt:
-        elapsed_time = time.time() - START_TIME
-        print(f"\nSearch interrupted after {format_time(elapsed_time)}")
-        print(f"Total keys checked: {KEYS_CHECKED:,}")
-        print("Check puzzle68_progress.txt for the best matches found so far.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\nError during search: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
 
+    
 if __name__ == "__main__":
     try:
         print("Starting Bitcoin Puzzle #68 Solver - Optimized for RTX 4090")
