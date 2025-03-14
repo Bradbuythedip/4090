@@ -18,9 +18,9 @@ from datetime import datetime, timedelta
 import threading
 import queue
 
-# GPU libraries
+# Import statements at the top
 import pycuda.driver as cuda
-import pycuda.autoinit
+import pycuda.autoinit  # This initializes CUDA and creates a context for device 0
 from pycuda.compiler import SourceModule
 
 # Set high precision for mpmath
@@ -224,23 +224,39 @@ __global__ void test_keys_with_mutations(uint64_t base_high, uint64_t base_low,
 def setup_gpu(gpu_id):
     """Set up a specific GPU for computation"""
     try:
-        cuda.init()
+        # Note: With pycuda.autoinit, a context is already created for device 0
+        # For other devices, we need to create new contexts carefully
         device = cuda.Device(gpu_id)
-        context = device.make_context()
+        
+        # Check if we need to create a new context
+        try:
+            # Try to get the current context for this device
+            ctx = device.make_context(flags=cuda.ctx_flags.SCHED_AUTO | cuda.ctx_flags.MAP_HOST)
+            ctx.push()  # Make it active
+        except Exception as e:
+            print(f"Warning with GPU {gpu_id} context: {e}")
+            # If we fail, the device might already have a context
+            return None
+            
+        # Compile module with kernel
         module = SourceModule(cuda_code)
         test_keys_kernel = module.get_function("test_keys")
         test_keys_with_mutations_kernel = module.get_function("test_keys_with_mutations")
+        
         print(f"GPU {gpu_id} initialized: {device.name()}")
         
+        # Return context in the data so we can properly clean up
         return {
             'device': device,
-            'context': context,
+            'context': ctx,
             'module': module,
             'test_keys': test_keys_kernel,
             'test_keys_with_mutations': test_keys_with_mutations_kernel
         }
     except Exception as e:
         print(f"Error initializing GPU {gpu_id}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def release_gpu(gpu_data):
@@ -767,36 +783,27 @@ def setup_search_spaces_for_gpus(gpu_count):
     
     return search_spaces
 
-def multi_gpu_search(num_gpus=6):
-    """Run search on multiple GPUs in parallel - optimized for 6x RTX 4090"""
+def multi_gpu_search(num_gpus=4):  # Default to 4 GPUs
+    """Run search on multiple GPUs in parallel - optimized for RTX 4090"""
     global RUNNING, SOLUTION_FOUND
     
     # Set up signal handler
     signal.signal(signal.SIGINT, handle_exit_signal)
     
     # Count available GPUs
-    cuda.init()
-    gpu_count = cuda.Device.count()
+    available_gpus = min(cuda.Device.count(), num_gpus)
+    print(f"Found {cuda.Device.count()} CUDA devices, will use {available_gpus}")
     
-    if gpu_count == 0:
-        print("No CUDA devices found!")
-        return None
-    
-    available_gpus = min(gpu_count, num_gpus)
-    print(f"Found {gpu_count} CUDA devices, will use {available_gpus}")
-    
-    # Check for RTX 4090s
+    # Check for RTX 4090s without creating new contexts
     for i in range(available_gpus):
         device = cuda.Device(i)
-        ctx = device.make_context()
         props = device.get_attributes()
-        free_mem, total_mem = cuda.mem_get_info()  # Correct way to get memory info
-        ctx.pop()  # Release context
-        print(f"GPU {i}: {device.name()} - {total_mem/(1024**3):.1f} GB VRAM")
+        # Don't check memory info here to avoid context issues
+        print(f"GPU {i}: {device.name()}")
         
         # If we detect RTX 4090, we can use larger batch sizes
-        if "4090" in device.name() or total_mem > (20 * 1024 * 1024 * 1024):  # >20GB VRAM
-            print(f"  Detected high-end GPU, will use optimized parameters")
+        if "4090" in device.name():
+            print(f"  Detected RTX 4090, will use optimized parameters")
     
     # Set up search spaces for all GPUs
     search_spaces = setup_search_spaces_for_gpus(available_gpus)
@@ -810,22 +817,16 @@ def multi_gpu_search(num_gpus=6):
         base_pattern = space['base_pattern']
         bit_mask = space['bit_mask']
         
-        # Set batch size based on estimated GPU memory
-        # RTX 4090 can handle much larger batches
-        device = cuda.Device(gpu_id)
-        ctx = device.make_context()
-        free_mem, total_mem = cuda.mem_get_info()  # Correct way to get memory info
-        ctx.pop()  # Release context after checking
+        # Use fixed batch sizes based on GPU ID to avoid context issues
+        # For RTX 4090s, use larger batches
+        batch_size = 50000000  # Default size
+        max_batches = 500
         
-        # For 24GB GPUs like RTX 4090, use much larger batch sizes
-        if total_mem > (20 * 1024 * 1024 * 1024):  # >20GB VRAM
-            batch_size = 100000000  # 100M keys per batch for RTX 4090
+        # For certain GPU models, increase batch size 
+        if "4090" in cuda.Device(gpu_id).name():
+            batch_size = 100000000  # 100M keys for RTX 4090
             max_batches = 1000
-        else:
-            # For smaller GPUs, scale accordingly
-            batch_size = min(50000000, int(free_mem * 0.6 / 16))
-            max_batches = 500
-        
+            
         print(f"GPU {gpu_id}: Assigned search space starting with {base_pattern}")
         print(f"GPU {gpu_id}: Using batch size: {batch_size:,}, max batches: {max_batches}")
         
@@ -898,7 +899,7 @@ def multi_gpu_search(num_gpus=6):
     return None
 
 if __name__ == "__main__":
-    print("Starting Bitcoin Puzzle #68 solver - Optimized for 6x RTX 4090")
+    print("Starting Bitcoin Puzzle #68 solver - Optimized for RTX 4090")
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
     print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
@@ -941,7 +942,7 @@ if __name__ == "__main__":
                 sys.exit(0)
         
         # Run the multi-GPU search
-        solution = multi_gpu_search(num_gpus=6)  # Use 6 GPUs
+        solution = multi_gpu_search(num_gpus=4)  # Use 4 GPUs
         
         if solution:
             print(f"\nFinal solution: {solution}")
