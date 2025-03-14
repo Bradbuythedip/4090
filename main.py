@@ -681,6 +681,7 @@ def partition_search_space(num_threads=4):
 
 def threaded_pattern_search(thread_id, start, end, pattern):
     """Search a specific range of the pattern space in a thread"""
+    global SOLUTION_FOUND  # Declare global at the beginning of the function
     print(f"Thread {thread_id}: Searching from {start:x} to {end:x}")
     
     base_int = int(CEDB187F_PATTERN, 16)
@@ -722,7 +723,6 @@ def threaded_pattern_search(thread_id, start, end, pattern):
             
             # Save solution
             save_solution(full_key_hex, result)
-            global SOLUTION_FOUND
             SOLUTION_FOUND = True
             
             return full_key_hex
