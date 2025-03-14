@@ -1,5 +1,5 @@
-# brute_force_puzzle68_fixed.py
-# Systematically searches the correct 68-bit key space for Bitcoin Puzzle #68
+# brute_force_puzzle68_direct.py
+# Systematically searches the explicit 68-bit key space for Bitcoin Puzzle #68
 
 import hashlib
 import binascii
@@ -32,9 +32,14 @@ TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubK
 PUZZLE_NUMBER = 68
 PHI_OVER_8 = float(PHI / 8)  # Convert to float for GPU compatibility
 
-# CORRECT 68-bit key range
-MIN_68BIT = 1 << 67  # 0x80000000000000000 (bit 67 set, exactly 68 bits)
-MAX_68BIT = (1 << 68) - 1  # 0xffffffffffffffff (all 68 bits set)
+# EXPLICIT DEFINITION of key space boundaries for puzzle 68
+# For a 68-bit key, we need to search from 2^67 to 2^68-1
+# 2^67 = 0x8000000000000000 (68-bit key with MSB set)
+# 2^68-1 = 0xFFFFFFFFFFFFFFFF (all 68 bits set)
+MIN_68BIT_INT = 1 << 67
+MAX_68BIT_INT = (1 << 68) - 1
+MIN_68BIT_HEX = format(MIN_68BIT_INT, '016x')  # 16 hex chars = 64 bits
+MAX_68BIT_HEX = format(MAX_68BIT_INT, '016x')
 
 # CUDA kernel for testing keys
 CUDA_CODE = """
@@ -42,49 +47,44 @@ CUDA_CODE = """
 #include <stdint.h>
 
 // Approximation of the ratio calculation for filtering
-__device__ float approx_ratio(uint64_t key_high, uint64_t key_low) {
+__device__ float approx_ratio(uint64_t key) {
+    // Simple approximation for filtering - actual ratio calculated on CPU for verification
     float result = 0.0f;
-    float x_approx = (float)(key_high ^ (key_low >> 12));
-    float y_approx = (float)(key_low ^ (key_high << 8));
+    float x_approx = (float)((key >> 32) ^ (key & 0xFFFFFFFF));
+    float y_approx = (float)((key & 0xFFFFFFFF) ^ ((key >> 32) << 8));
     
     if (y_approx != 0.0f) {
         result = 0.202254f + (float)((x_approx * 723467.0f + y_approx * 13498587.0f) / 
-                                   (1e12 + key_low + key_high) - 0.5f) * 0.00001f;
+                                   (1e12 + key) - 0.5f) * 0.00001f;
     }
     return result;
 }
 
 // Hash approximation for filtering
-__device__ uint32_t approx_hash(uint64_t key_high, uint64_t key_low) {
+__device__ uint32_t approx_hash(uint64_t key) {
     uint32_t h = 0xe0b8a2ba; // First bytes of target
-    h ^= key_high >> 32;
-    h ^= key_high;
-    h ^= key_low >> 32;
-    h ^= key_low;
+    h ^= (key >> 32);
+    h ^= (key & 0xFFFFFFFF);
     h ^= h >> 16;
     return h;
 }
 
-__global__ void test_keys(uint64_t start_high, uint64_t start_low, 
-                         uint32_t *offsets, int offset_count,
-                         float target_ratio, uint32_t target_hash_prefix,
-                         uint32_t *candidates, float *ratios, uint32_t *count) {
+__global__ void test_keys(uint64_t start_key, 
+                         uint32_t batch_size,
+                         float target_ratio, 
+                         uint32_t target_hash_prefix,
+                         uint64_t *candidates, 
+                         float *ratios, 
+                         uint32_t *count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= offset_count) return;
+    if (idx >= batch_size) return;
     
-    // Get this thread's offset
-    uint32_t offset = offsets[idx];
-    
-    // Create full key by adding offset
-    uint64_t key_low = start_low + offset;
-    uint64_t key_high = start_high;
-    if (key_low < start_low) {  // Handle overflow
-        key_high++;
-    }
+    // Create the key for this thread
+    uint64_t key = start_key + idx;
     
     // Calculate approximate ratio and hash
-    float ratio = approx_ratio(key_high, key_low);
-    uint32_t hash_prefix = approx_hash(key_high, key_low);
+    float ratio = approx_ratio(key);
+    uint32_t hash_prefix = approx_hash(key);
     
     // Store ratio for sorting
     ratios[idx] = ratio;
@@ -97,7 +97,7 @@ __global__ void test_keys(uint64_t start_high, uint64_t start_low,
     if (ratio_diff < 0.0005f || (hash_diff & 0xFFFF0000) == 0) {
         uint32_t pos = atomicAdd(count, 1);
         if (pos < 1000) {  // Limit to 1000 candidates
-            candidates[pos] = offset;
+            candidates[pos] = key;
         }
     }
 }
@@ -183,12 +183,6 @@ def verify_private_key(private_key_hex):
         }
     except Exception as e:
         return {'match': False, 'error': str(e)}
-
-def count_bits(n):
-    """Count the number of significant bits in n"""
-    if n == 0:
-        return 0
-    return n.bit_length()
 
 def format_private_key(key_int):
     """Format a private key with proper padding to 64 hex characters"""
@@ -301,41 +295,50 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
             ctx.pop()
             return None
         
-        # Calculate key space boundaries - FIXED
+        # Determine the starting key
         if start_key is None:
             # Try to load last position from progress file
             if os.path.exists("puzzle68_brute_force_progress.txt"):
                 try:
                     with open("puzzle68_brute_force_progress.txt", "r") as f:
-                        start_key = int(f.readline().strip(), 16)
+                        start_key_hex = f.readline().strip()
+                        # Extract only the last 16 characters (64 bits) and convert to int
+                        if len(start_key_hex) > 16:
+                            start_key_hex = start_key_hex[-16:]
+                        start_key = int(start_key_hex, 16)
+                        
                         # Make sure it's in range
-                        if start_key < MIN_68BIT:
-                            print(f"Loaded start key {format_private_key(start_key)} is below the 68-bit range.")
-                            print(f"Setting to minimum 68-bit value: {format_private_key(MIN_68BIT)}")
-                            start_key = MIN_68BIT
-                        print(f"Resuming from key: {format_private_key(start_key)}")
-                except:
-                    print("Could not read progress file, starting from minimum 68-bit value")
-                    start_key = MIN_68BIT
+                        if start_key < MIN_68BIT_INT:
+                            print(f"Loaded start key 0x{start_key_hex} is below the 68-bit range.")
+                            print(f"Setting to minimum 68-bit value: 0x{MIN_68BIT_HEX}")
+                            start_key = MIN_68BIT_INT
+                        print(f"Resuming from key: 0x{format(start_key, '016x')}")
+                except Exception as e:
+                    print(f"Could not read progress file: {e}")
+                    print("Starting from minimum 68-bit value")
+                    start_key = MIN_68BIT_INT
             else:
-                start_key = MIN_68BIT
+                start_key = MIN_68BIT_INT
         
-        if start_key < MIN_68BIT:
-            print(f"Start key is below the 68-bit range. Setting to minimum 68-bit value.")
-            start_key = MIN_68BIT
+        # Ensure start_key is within range
+        if start_key < MIN_68BIT_INT:
+            print(f"Start key 0x{format(start_key, '016x')} is below the 68-bit range.")
+            print(f"Setting to minimum 68-bit value: 0x{MIN_68BIT_HEX}")
+            start_key = MIN_68BIT_INT
         
-        if start_key > MAX_68BIT:
-            print(f"Start key exceeds 68-bit range. Setting to maximum 68-bit value.")
-            start_key = MAX_68BIT
+        if start_key > MAX_68BIT_INT:
+            print(f"Start key 0x{format(start_key, '016x')} exceeds 68-bit range.")
+            print(f"Setting to maximum 68-bit value: 0x{MAX_68BIT_HEX}")
+            start_key = MAX_68BIT_INT
         
-        print(f"Starting search at key: {format_private_key(start_key)}")
-        print(f"Minimum 68-bit key: {format_private_key(MIN_68BIT)}")
-        print(f"Maximum 68-bit key: {format_private_key(MAX_68BIT)}")
+        print(f"Starting search at key: 0x{format(start_key, '016x')}")
+        print(f"Minimum 68-bit key: 0x{MIN_68BIT_HEX}")
+        print(f"Maximum 68-bit key: 0x{MAX_68BIT_HEX}")
         
         # Calculate total search space and progress
-        total_space = MAX_68BIT - MIN_68BIT + 1  # Total number of 68-bit keys
-        search_space_left = MAX_68BIT - start_key + 1
-        progress_pct = ((start_key - MIN_68BIT) / total_space) * 100
+        total_space = MAX_68BIT_INT - MIN_68BIT_INT + 1
+        search_space_left = MAX_68BIT_INT - start_key + 1
+        progress_pct = ((start_key - MIN_68BIT_INT) / total_space) * 100
         print(f"Total search space: {format_large_int(total_space)} keys")
         print(f"Search space remaining: {format_large_int(search_space_left)} keys")
         print(f"Progress: {progress_pct:.8f}%")
@@ -344,12 +347,10 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
         target_hash_prefix = int(TARGET_HASH[:8], 16)
         
         # Allocate memory on GPU
-        offsets = np.arange(batch_size, dtype=np.uint32)
-        candidates = np.zeros(1000, dtype=np.uint32)
+        candidates = np.zeros(1000, dtype=np.uint64)
         count = np.zeros(1, dtype=np.uint32)
         ratios = np.zeros(batch_size, dtype=np.float32)
         
-        offsets_gpu = cuda.mem_alloc(offsets.nbytes)
         candidates_gpu = cuda.mem_alloc(candidates.nbytes)
         count_gpu = cuda.mem_alloc(count.nbytes)
         ratios_gpu = cuda.mem_alloc(ratios.nbytes)
@@ -361,36 +362,26 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
         
         try:
             # Process batches until we reach the end of 68-bit range
-            while current_key <= MAX_68BIT:
+            while current_key <= MAX_68BIT_INT:
                 batch_start_time = time.time()
                 
                 # Calculate actual batch size (might be smaller near the end)
-                current_batch_size = min(batch_size, MAX_68BIT - current_key + 1)
-                
-                # Split the current key into high and low parts
-                current_key_high = current_key >> 32
-                current_key_low = current_key & 0xFFFFFFFF
-                
-                # Prepare offsets for this batch
-                offsets = np.arange(min(current_batch_size, batch_size), dtype=np.uint32)
+                current_batch_size = min(batch_size, MAX_68BIT_INT - current_key + 1)
                 
                 # Reset candidate counter
                 count[0] = 0
                 
                 # Copy data to GPU
-                cuda.memcpy_htod(offsets_gpu, offsets)
                 cuda.memcpy_htod(count_gpu, count)
                 
                 # Set up kernel grid
                 block_size = 256
                 grid_size = (current_batch_size + block_size - 1) // block_size
                 
-                # Launch kernel
+                # Launch kernel - SIMPLIFIED APPROACH: just pass the 64-bit key directly
                 test_keys_kernel(
-                    np.uint64(current_key_high),
-                    np.uint64(current_key_low),
-                    offsets_gpu,
-                    np.int32(current_batch_size),
+                    np.uint64(current_key),
+                    np.uint32(current_batch_size),
                     np.float32(PHI_OVER_8),
                     np.uint32(target_hash_prefix),
                     candidates_gpu,
@@ -413,16 +404,16 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
                 # Update current key for next batch
                 current_key += current_batch_size
                 
-                # Save progress
+                # Save progress - save the actual 68-bit key in hex
                 with open("puzzle68_brute_force_progress.txt", "w") as f:
-                    f.write(format_private_key(current_key) + "\n")
+                    f.write(format(current_key, '016x') + "\n")
                 
                 # Calculate progress
-                search_space_left = MAX_68BIT - current_key + 1
-                progress_pct = ((current_key - MIN_68BIT) / total_space) * 100
+                search_space_left = MAX_68BIT_INT - current_key + 1
+                progress_pct = ((current_key - MIN_68BIT_INT) / total_space) * 100
                 
                 print(f"\nBatch completed in {format_time(batch_time)}")
-                print(f"Current key: {format_private_key(current_key)}")
+                print(f"Current key: 0x{format(current_key, '016x')}")
                 print(f"Total keys checked: {format_large_int(total_keys_checked)}")
                 print(f"Keys/sec: {int(current_batch_size / batch_time):,}")
                 print(f"Progress: {progress_pct:.8f}%")
@@ -445,57 +436,51 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
                 if candidates_found > 0:
                     print(f"Verifying {candidates_found} candidates on CPU...")
                     
-                    # Sort candidates by ratio proximity to PHI/8
-                    best_ratio_indices = np.argsort(np.abs(ratios[:current_batch_size] - PHI_OVER_8))[:min(200, current_batch_size)]
-                    
                     # Combine explicit candidates with best ratio candidates
-                    all_offsets = set()
+                    all_keys = set()
                     for i in range(candidates_found):
-                        all_offsets.add(int(candidates[i]))
+                        all_keys.add(int(candidates[i]))
                     
+                    # Also add the best ratio matches
+                    best_ratio_indices = np.argsort(np.abs(ratios[:current_batch_size] - PHI_OVER_8))[:min(200, current_batch_size)]
                     for idx in best_ratio_indices:
-                        if idx < current_batch_size:  # Make sure index is in bounds
-                            all_offsets.add(int(offsets[idx]))
+                        if idx < current_batch_size:
+                            all_keys.add(current_key - current_batch_size + idx)
                     
-                    # Check each candidate - adjust base key for this batch
-                    batch_base_key = current_key - current_batch_size
-                    for offset in all_offsets:
-                        if offset < current_batch_size:  # Make sure offset is valid
-                            full_key_int = batch_base_key + offset
+                    # Check each candidate
+                    for key_int in all_keys:
+                        # Ensure it's in the 68-bit range
+                        if key_int < MIN_68BIT_INT or key_int > MAX_68BIT_INT:
+                            continue
+                        
+                        # Format to full 64-hex-character private key (padding with leading zeros)
+                        full_key = format_private_key(key_int)
+                        result = verify_private_key(full_key)
+                        
+                        # Check if we found a solution
+                        if result and result.get('match', False):
+                            print("\n*** SOLUTION FOUND! ***")
+                            print(f"Private key: {full_key}")
+                            print(f"Generated hash: {result['generated_hash']}")
+                            print(f"Target hash: {TARGET_HASH}")
                             
-                            # Ensure it's in the 68-bit range
-                            if full_key_int < MIN_68BIT or full_key_int > MAX_68BIT:
-                                continue
+                            # Save solution
+                            save_solution(full_key, result)
                             
-                            # Format and verify
-                            full_key = format_private_key(full_key_int)
-                            result = verify_private_key(full_key)
+                            # Clean up and return
+                            candidates_gpu.free()
+                            count_gpu.free()
+                            ratios_gpu.free()
+                            ctx.pop()
                             
-                            # Check if we found a solution
-                            if result and result.get('match', False):
-                                print("\n*** SOLUTION FOUND! ***")
-                                print(f"Private key: {full_key}")
-                                print(f"Generated hash: {result['generated_hash']}")
-                                print(f"Target hash: {TARGET_HASH}")
-                                
-                                # Save solution
-                                save_solution(full_key, result)
-                                
-                                # Clean up and return
-                                offsets_gpu.free()
-                                candidates_gpu.free()
-                                count_gpu.free()
-                                ratios_gpu.free()
-                                ctx.pop()
-                                
-                                return full_key
-                            
-                            # Track best matches
-                            if result:
-                                ratio_diff = float(result.get('ratio_diff', 1.0))
-                                best_matches.append((full_key, ratio_diff, result.get('generated_hash', '')))
-                                best_matches.sort(key=lambda x: x[1])  # Sort by ratio difference
-                                best_matches = best_matches[:5]  # Keep top 5
+                            return full_key
+                        
+                        # Track best matches
+                        if result:
+                            ratio_diff = float(result.get('ratio_diff', 1.0))
+                            best_matches.append((full_key, ratio_diff, result.get('generated_hash', '')))
+                            best_matches.sort(key=lambda x: x[1])  # Sort by ratio difference
+                            best_matches = best_matches[:5]  # Keep top 5
                 
                 # Show best matches so far
                 if best_matches:
@@ -508,7 +493,7 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
                 # Save detailed progress
                 with open("puzzle68_brute_force_details.txt", "w") as f:
                     f.write(f"Search progress as of {time.ctime()}\n")
-                    f.write(f"Current key: {format_private_key(current_key)}\n")
+                    f.write(f"Current key: 0x{format(current_key, '016x')}\n")
                     f.write(f"Total keys checked: {format_large_int(total_keys_checked)}\n")
                     f.write(f"Progress: {progress_pct:.8f}%\n")
                     f.write(f"Keys/sec: {int(current_batch_size / batch_time):,}\n")
@@ -544,7 +529,6 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
     finally:
         # Clean up GPU resources
         try:
-            offsets_gpu.free()
             candidates_gpu.free()
             count_gpu.free()
             ratios_gpu.free()
@@ -562,13 +546,16 @@ def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
 
 def main():
     """Main function"""
-    print("Brute Force Bitcoin Puzzle #68 Solver (FIXED)")
+    print("\n" + "="*80)
+    print("Brute Force Bitcoin Puzzle #68 Solver (FIXED - DIRECT 68-BIT KEY HANDLING)")
+    print("="*80)
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
     print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
     print(f"Target ratio: φ/8 = {PHI_OVER_8}")
     print(f"Searching for private keys with EXACTLY 68 bits")
-    print(f"Key range: {format_private_key(MIN_68BIT)} to {format_private_key(MAX_68BIT)}")
+    print(f"Key range: 0x{MIN_68BIT_HEX} to 0x{MAX_68BIT_HEX}")
+    print("="*80 + "\n")
     
     # Check whether we can use CUDA
     if not HAS_CUDA:
