@@ -221,7 +221,7 @@ __global__ void test_keys_aggressive(uint64_t prefix_high, uint64_t prefix_low,
 def setup_gpu(gpu_id):
     """Set up a specific GPU for computation"""
     try:
-        cuda.init()
+        # Don't reinitialize CUDA here
         device = cuda.Device(gpu_id)
         context = device.make_context()
         module = SourceModule(cuda_code)
@@ -238,6 +238,8 @@ def setup_gpu(gpu_id):
         }
     except Exception as e:
         print(f"Error initializing GPU {gpu_id}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def release_gpu(gpu_data):
@@ -747,8 +749,7 @@ def multi_gpu_search():
     # Set up signal handler
     signal.signal(signal.SIGINT, handle_exit_signal)
     
-    # Count available GPUs
-    cuda.init()
+    # Count available GPUs - don't re-initialize CUDA here
     gpu_count = cuda.Device.count()
     
     if gpu_count == 0:
@@ -857,9 +858,11 @@ if __name__ == "__main__":
     print(f"Searching for private keys with EXACTLY 68 bits")
     print(f"Base pattern: {BASE_PATTERN}")
     
+    # Initialize CUDA once
+    cuda.init()
+    
     # Check GPU devices
     print("\nGPU Information:")
-    cuda.init()
     device_count = cuda.Device.count()
     print(f"Found {device_count} CUDA devices")
 
@@ -876,6 +879,9 @@ if __name__ == "__main__":
         print(f"  Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
         print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
         print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")
+    
+    # Properly handle multiprocessing with CUDA
+    mp.set_start_method('spawn', force=True)  # This is crucial for CUDA with multiprocessing
     
     # Display estimated runtime
     print("\nRunning multi-GPU search optimized for RTX 4090s")
