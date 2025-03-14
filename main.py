@@ -1,5 +1,5 @@
-# brute_force_puzzle68_fixed.py
-# Searches the 68-bit key space for Bitcoin Puzzle #68 using 32-bit chunks
+# brute_force_puzzle68_keyfix.py
+# Searches the 68-bit key space for Bitcoin Puzzle #68 with proper key verification
 
 import hashlib
 import binascii
@@ -201,7 +201,7 @@ def verify_private_key(private_key_hex):
 def key_parts_to_full_hex(key_high, key_mid, key_low):
     """Convert 3-part key to a full 64-character hex string"""
     # Combine the 3 parts into a single integer
-    full_int = (key_high << 48) | (key_mid << 24) | key_low
+    full_int = (int(key_high) << 48) | (int(key_mid) << 24) | int(key_low)
     # Convert to hex and pad to 64 chars
     return format(full_int, '016x').zfill(64)
 
@@ -367,15 +367,33 @@ def brute_force_search(start_key_hex=None, batch_size=5000000, device_id=0):
                     with open("puzzle68_brute_force_progress.txt", "r") as f:
                         start_key_hex = f.readline().strip()
                         print(f"Loaded key from progress file: {start_key_hex}")
+                        # Add leading 0x if necessary for parsing
+                        if not start_key_hex.startswith("0x"):
+                            start_key_hex = "0x" + start_key_hex
                 except Exception as e:
                     print(f"Could not read progress file: {e}")
-                    start_key_hex = f"{MIN_KEY_HIGH:04x}{MIN_KEY_LOW:012x}"
+                    start_key_hex = f"0x{MIN_KEY_HIGH:04x}{MIN_KEY_LOW:012x}"
             else:
-                start_key_hex = f"{MIN_KEY_HIGH:04x}{MIN_KEY_LOW:012x}"
+                start_key_hex = f"0x{MIN_KEY_HIGH:04x}{MIN_KEY_LOW:012x}"
         
         # Parse the starting key
         try:
-            key_high, key_mid, key_low = full_hex_to_key_parts(start_key_hex)
+            # Remove the "0x" prefix if present
+            if start_key_hex.startswith("0x"):
+                start_key_hex = start_key_hex[2:]
+                
+            # Make sure the key is at least 16 hex digits
+            if len(start_key_hex) < 16:
+                start_key_hex = start_key_hex.zfill(16)
+            elif len(start_key_hex) > 16:
+                # Take the rightmost 16 characters
+                start_key_hex = start_key_hex[-16:]
+            
+            # Convert to integer and extract parts
+            start_key_int = int(start_key_hex, 16)
+            key_high = (start_key_int >> 48) & 0xFFFF
+            key_mid = (start_key_int >> 24) & 0xFFFFFF
+            key_low = start_key_int & 0xFFFFFF
             
             # Ensure the key is in the valid range
             if not is_key_in_range(key_high, key_mid, key_low):
@@ -396,7 +414,7 @@ def brute_force_search(start_key_hex=None, batch_size=5000000, device_id=0):
         print(f"Starting search at: {get_key_progress_string(key_high, key_mid, key_low)}")
         
         # Calculate total search space
-        total_keys = 2**68 - 2**67
+        total_keys = 2**68 - 2**67  # Exactly half of the 68-bit space
         progress_pct = calculate_progress_percentage(key_high, key_mid, key_low)
         
         print(f"Total search space: {format_large_int(total_keys)} keys")
@@ -539,12 +557,32 @@ def brute_force_search(start_key_hex=None, batch_size=5000000, device_id=0):
                     
                     # Check each candidate
                     for i in range(candidates_found):
-                        h = candidates_high[i]
-                        m = candidates_mid[i]
-                        l = candidates_low[i]
+                        h = int(candidates_high[i])
+                        m = int(candidates_mid[i])
+                        l = int(candidates_low[i])
                         
-                        # Format to full private key
+                        # Make sure the key is in the correct 68-bit range
+                        if not is_key_in_range(h, m, l):
+                            continue
+                        
+                        # Format to full private key - using 64 chars with leading zeros
                         full_key = key_parts_to_full_hex(h, m, l)
+                        
+                        # Double-check that we're not generating keys with all leading zeros
+                        # The private key for a 68-bit key should start with '8' not '0'
+                        if full_key.startswith('0000'):
+                            # Calculate the correct full key with 68 bits
+                            # This should convert to a value that starts with '8'
+                            full_int = (h << 48) | (m << 24) | l
+                            full_key = format(full_int, 'x').zfill(64)
+                            
+                            # Ensure it starts with '8' if it's supposed to be 68 bits
+                            if not (full_key.startswith('8') or full_key.startswith('9') or
+                                   full_key.startswith('a') or full_key.startswith('b') or
+                                   full_key.startswith('c') or full_key.startswith('d') or
+                                   full_key.startswith('e') or full_key.startswith('f')):
+                                print(f"Warning: Generated key {full_key} is not in 68-bit range")
+                                continue
                         
                         # Verify if it's a solution
                         result = verify_private_key(full_key)
@@ -641,7 +679,7 @@ def brute_force_search(start_key_hex=None, batch_size=5000000, device_id=0):
 def main():
     """Main function"""
     print("\n" + "="*80)
-    print("Brute Force Bitcoin Puzzle #68 Solver (FIXED - SPLIT KEY APPROACH)")
+    print("Brute Force Bitcoin Puzzle #68 Solver (FIXED - CORRECT KEY FORMAT)")
     print("="*80)
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
