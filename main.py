@@ -384,9 +384,12 @@ def save_solution(key, result):
             f.write(f"SOLUTION FOUND AT {time.ctime()}\n")
             f.write(f"Private key: {key}\n")
             f.write(f"ScriptPubKey: 76a914{TARGET_HASH}88ac\n")
-    except Exception as e:
-        print(f"Error saving solution: {e}")
 
+  except OverflowError as e:
+                print(f"GPU {gpu_id}: Overflow error in batch {batch}: {e}")
+                print(f"GPU {gpu_id}: Skipping to next batch")
+                continue
+            
 def save_progress(best_matches, operation="", attempt_count=0, force_save=False):
     """Save current progress and best matches to a file with more detailed stats"""
     global KEYS_CHECKED, BEST_GLOBAL_MATCHES
@@ -442,7 +445,6 @@ def format_time(seconds):
         hours = int(seconds / 3600)
         minutes = int((seconds % 3600) / 60)
         return f"{hours} hours, {minutes} minutes"
-
 def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000, max_batches=100):
     """GPU search focusing on a specific pattern, optimized for RTX 4090"""
     global SOLUTION_FOUND  # Add global declaration here
@@ -466,6 +468,264 @@ def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000,
         if not gpu_data:
             return []
         
+        # Make GPU context current
+        gpu_data['context'].push()
+        
+        # Split the base key
+        base_high = base_int >> 32
+        base_low = base_int & 0xFFFFFFFF
+        
+        # Clear the bits we want to explore
+        base_low_masked = base_low & ~bit_mask
+        
+        # Determine optimal batch size based on GPU memory and mask
+        free_mem, total_mem = cuda.mem_get_info()
+        max_possible_batch = int(free_mem * 0.8 / 16)  # 16 bytes per key (estimated)
+        
+        # Calculate maximum safe batch size for this mask
+        # Ensure it doesn't exceed uint32 range considering start offset
+        max_safe_batch = min(batch_size, (0xFFFFFFFF - bit_mask) // max_batches)
+        
+        # Use the smaller of memory-based batch size or safe batch size
+        batch_size = min(max_possible_batch, max_safe_batch, 100000000)  # Cap at 100M keys
+        
+        print(f"GPU {gpu_id}: Search around: {format_private_key(base_int)}")
+        print(f"GPU {gpu_id}: Bit length: {count_bits(base_int)}")
+        print(f"GPU {gpu_id}: Using batch size: {batch_size:,}")
+        
+        # First 4 bytes of target hash as uint32
+        target_hash_prefix = int(TARGET_HASH[:8], 16)
+        
+        # Allocate memory on GPU - larger for RTX 4090
+        candidates = np.zeros(2000, dtype=np.uint32)  # Increased from 1000
+        count = np.zeros(1, dtype=np.uint32)
+        ratios = np.zeros(batch_size, dtype=np.float32)
+        
+        candidates_gpu = cuda.mem_alloc(candidates.nbytes)
+        count_gpu = cuda.mem_alloc(count.nbytes)
+        ratios_gpu = cuda.mem_alloc(ratios.nbytes)
+        
+        # Configure grid size for RTX 4090
+        block_size = 512  # Increased from 256 for RTX 4090
+        
+        batch = 0
+        while batch < max_batches and not (found_solution or SOLUTION_FOUND):
+            # Start with a fresh offset range for this batch
+            start_offset = batch * batch_size
+            
+            # Create offsets safely
+            try:
+                # Create a range that doesn't exceed uint32 bounds
+                if start_offset + batch_size > 0xFFFFFFFF:
+                    # If we'd overflow, just use remainder of range
+                    end_offset = 0xFFFFFFFF
+                    current_batch_size = end_offset - start_offset
+                    print(f"GPU {gpu_id}: Adjusting batch size to {current_batch_size:,} to avoid overflow")
+                else:
+                    current_batch_size = batch_size
+                    
+                offsets = np.arange(start_offset, start_offset + current_batch_size, dtype=np.uint64) & bit_mask
+                offsets = offsets.astype(np.uint32)  # Convert safely after masking
+                
+                # Allocate fresh GPU memory for offsets every batch to avoid leaks
+                offsets_gpu = cuda.mem_alloc(offsets.nbytes)
+                
+                # Reset candidate counter
+                count[0] = 0
+                
+                # Copy data to GPU
+                cuda.memcpy_htod(offsets_gpu, offsets)
+                cuda.memcpy_htod(count_gpu, count)
+                
+                # Set up kernel grid
+                grid_size = (current_batch_size + block_size - 1) // block_size
+                
+                # Alternate between kernels for diversity
+                if batch % 2 == 0:
+                    # Standard kernel
+                    gpu_data['test_keys'](
+                        np.uint64(base_high),
+                        np.uint64(base_low_masked),
+                        offsets_gpu,
+                        np.int32(current_batch_size),
+                        np.float32(PHI_OVER_8),
+                        np.uint32(target_hash_prefix),
+                        candidates_gpu,
+                        ratios_gpu,
+                        count_gpu,
+                        block=(block_size, 1, 1),
+                        grid=(grid_size, 1)
+                    )
+                else:
+                    # Aggressive kernel - process fewer keys but more mutations per key
+                    keys_per_thread = 8  # Each thread handles 8 keys with 8 mutations each
+                    smaller_batch = current_batch_size // keys_per_thread
+                    smaller_grid_size = (smaller_batch + block_size - 1) // block_size
+                    
+                    gpu_data['test_keys_aggressive'](
+                        np.uint64(base_high),
+                        np.uint64(base_low_masked),
+                        np.uint32(start_offset & 0xFFFFFFFF),  # Ensure uint32 compatible
+                        np.uint32(keys_per_thread),
+                        np.float32(PHI_OVER_8),
+                        np.uint32(target_hash_prefix),
+                        candidates_gpu,
+                        ratios_gpu,
+                        count_gpu,
+                        np.uint32(PUZZLE_NUMBER),
+                        block=(block_size, 1, 1),
+                        grid=(smaller_grid_size, 1)
+                    )
+                
+                # Get results back
+                cuda.memcpy_dtoh(candidates, candidates_gpu)
+                cuda.memcpy_dtoh(count, count_gpu)
+                cuda.memcpy_dtoh(ratios, ratios_gpu)
+                
+                # Free this batch's offset memory
+                offsets_gpu.free()
+                
+                total_keys_checked += current_batch_size
+
+            
+                #Report progress
+                candidates_found = min(int(count[0]), 2000)
+                if candidates_found > 0 or batch % 10 == 0:
+                    print(f"\nGPU {gpu_id}: Batch {batch+1}/{max_batches} completed")
+                    print(f"GPU {gpu_id}: Keys checked: {total_keys_checked:,}")
+                    print(f"GPU {gpu_id}: Candidates found: {candidates_found}")
+            
+            # Find the best ratio candidates directly from GPU results
+            best_indices = np.argsort(np.abs(ratios[:current_batch_size] - PHI_OVER_8))[:250]  # Check more candidates
+            
+            # Combine candidates from both methods
+            all_candidates = []
+            
+            # Add explicit candidates
+            for i in range(candidates_found):
+                offset = candidates[i]
+                all_candidates.append(offset)
+                
+            # Add best ratio candidates
+            for idx in best_indices:
+                offset = offsets[idx]
+                if offset not in all_candidates:
+                    all_candidates.append(offset)
+            
+            # Verify the most promising candidates on CPU with high precision
+            local_candidates_verified = 0
+            for offset in all_candidates:
+                # Check if solution has been found by another thread
+                if SOLUTION_FOUND:
+                    break
+                    
+                # Use Python integers for bitwise operations to avoid overflow
+                offset_int = int(offset)
+                
+                # Create full key by applying the offset to the base
+                full_key_int = (base_int & ~bit_mask) | offset_int
+                
+                # Format the key
+                full_key = format_private_key(full_key_int)
+                
+                # Quick check: ensure it has exactly 68 bits
+                if count_bits(full_key_int) != 68:
+                    continue
+                    
+                # Verify with high precision
+                result = verify_private_key(full_key)
+                local_candidates_verified += 1
+                
+                # Check if we found the solution
+                if result and result.get('match'):
+                    print(f"\n*** SOLUTION FOUND ON GPU {gpu_id} ***")
+                    print(f"Key: {full_key}")
+                    print(f"Generated hash: {result.get('generated_hash')}")
+                    print(f"ScriptPubKey: 76a914{result.get('generated_hash')}88ac")
+                    
+                    # Save solution
+                    save_solution(full_key, result)
+                    
+                    # Add to result queue to signal other processes
+                    RESULT_QUEUE.put((full_key, result))
+                    found_solution = True
+                    
+                    # Exit immediately on match
+                    with GLOBAL_LOCK:
+                        SOLUTION_FOUND = True
+                    print("\nExiting program immediately with solution found.")
+                    os._exit(0)
+                    
+                    break
+                
+                # Track best match by ratio
+                if result:
+                    ratio_diff = float(result.get('ratio_diff', 1.0))
+                    if ratio_diff < best_ratio_diff:
+                        best_ratio_diff = ratio_diff
+                        
+                        # Add to best matches
+                        best_matches.append((full_key, result))
+                        best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
+                        best_matches = best_matches[:5]  # Keep top 5
+                        
+                        # Report improvement
+                        print(f"\nGPU {gpu_id}: New best match: {full_key}")
+                        print(f"Bit length: {count_bits(full_key_int)}")
+                        print(f"Ratio diff: {ratio_diff}")
+                        print(f"Generated hash: {result.get('generated_hash')}")
+                        
+                        if ratio_diff < 1e-10:
+                            print("EXTREMELY CLOSE MATCH FOUND!")
+                        
+                        # Save progress on significant improvement
+                        save_progress(best_matches, f"GPU {gpu_id} search", total_keys_checked, force_save=True)
+            
+            # Save progress every 10 batches
+            if batch % 10 == 0:
+                save_progress(best_matches, f"GPU {gpu_id} search", total_keys_checked)
+                
+            # Report verification stats
+            if local_candidates_verified > 0:
+                print(f"GPU {gpu_id}: Verified {local_candidates_verified} candidates on CPU")
+                
+            batch += 1
+        
+        # Free GPU memory
+        offsets_gpu.free()
+        candidates_gpu.free()
+        count_gpu.free()
+        ratios_gpu.free()
+        
+        return best_matches
+    
+    except Exception as e:
+        print(f"Error in GPU {gpu_id} search: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+    
+    finally:
+        # Ensure GPU resources are released even if an exception occurs
+        if 'gpu_data' in locals() and gpu_data:
+            try:
+                release_gpu(gpu_data)
+                print(f"GPU {gpu_id} resources released")
+            except Exception as e:
+                print(f"Error releasing GPU {gpu_id} resources: {e}")
+                
+        # Exit the process cleanly if there was an error
+        if SOLUTION_FOUND:
+            print(f"GPU {gpu_id}: Solution found, exiting")
+            return []
+    
+    # Initialize variables
+    found_solution = False
+    total_keys_checked = 0
+    best_matches = []
+    best_ratio_diff = 1.0
+    
+    try:
         # Make GPU context current
         gpu_data['context'].push()
         
@@ -683,17 +943,14 @@ def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000,
     
     finally:
         # Ensure GPU resources are released even if an exception occurs
-        if gpu_data:
+    if gpu_data:
             try:
                 release_gpu(gpu_data)
                 print(f"GPU {gpu_id} resources released")
             except Exception as e:
                 print(f"Error releasing GPU {gpu_id} resources: {e}")
-        
-        # Exit the process cleanly if there was an error and solution found
-        if SOLUTION_FOUND:
-            print(f"GPU {gpu_id}: Solution found, exiting")
-            return []
+
+
 
 
 def handle_exit_signal(sig, frame):
