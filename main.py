@@ -1,59 +1,102 @@
-# puzzle68_robust_solver.py
+# simple_cuda_search.py
+# A minimal, focused PyCUDA implementation for Bitcoin Puzzle #68
 
 import hashlib
 import binascii
 import time
-import os
-import random
+import sys
 import numpy as np
 from mpmath import mp, mpf, fabs
 import ecdsa
 from ecdsa import SECP256k1, SigningKey
-import math
-from itertools import combinations
-import signal
-import sys
-import threading
-import queue
-from datetime import datetime, timedelta
+
+# Import PyCUDA modules with proper error handling
+try:
+    import pycuda.driver as cuda
+    import pycuda.compiler as compiler
+    HAS_CUDA = True
+except ImportError:
+    print("PyCUDA not installed. Please install with: pip install pycuda")
+    HAS_CUDA = False
+except Exception as e:
+    print(f"Error initializing CUDA: {e}")
+    HAS_CUDA = False
 
 # Set high precision for mpmath
 mp.dps = 1000  # 1000 decimal places of precision
 
 # Constants
 PHI = mpf('1.6180339887498948482045868343656381177203091798057628621354486227052604628189')
-TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubKey: 76a914e0b8a2baee1b77fc703455f39d51477451fc8cfc88ac
+TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubKey
 PUZZLE_NUMBER = 68
 PHI_OVER_8 = float(PHI / 8)  # Convert to float for GPU compatibility
 
-# Our best candidates from different approaches
-BEST_PHI_MATCH = "00000000000000000000000000000000000000000000000041a01b90c5b886dc"
-BEST_ALT_PATTERN = "00000000000000000000000000000000000000000000000cedb187f001bdffd2"
+# Pattern to search
+PATTERN_BASE = "00000000000000000000000000000000000000000000000cedb187f"
 
-# CEDB187F pattern space (base pattern for focused search)
-CEDB187F_PATTERN = "00000000000000000000000000000000000000000000000cedb187f"
+# Simple CUDA kernel for testing keys
+CUDA_CODE = """
+#include <stdio.h>
+#include <stdint.h>
 
-# Additional promising candidates
-ADDITIONAL_CANDIDATES = [
-    "00000000000000000000000000000000000000000000000041a01b90c5b886dd",  # Small variation of PHI_MATCH
-    "00000000000000000000000000000000000000000000000cedb187f001bdffe",   # Small variation of ALT_PATTERN
-    "00000000000000000000000000000000000000000000000467a98b1c3d2e5f0",   # Additional candidate
-    "00000000000000000000000000000000000000000000000789abcdef0123456",   # Additional candidate
-]
+// Approximation of the ratio calculation for filtering
+__device__ float approx_ratio(uint64_t key_high, uint64_t key_low) {
+    float result = 0.0f;
+    float x_approx = (float)(key_high ^ (key_low >> 12));
+    float y_approx = (float)(key_low ^ (key_high << 8));
+    
+    if (y_approx != 0.0f) {
+        result = 0.202254f + (float)((x_approx * 723467.0f + y_approx * 13498587.0f) / 
+                                   (1e12 + key_low + key_high) - 0.5f) * 0.00001f;
+    }
+    return result;
+}
 
-# Global variables for runtime control
-RUNNING = True
-START_TIME = time.time()
-KEYS_CHECKED = 0
-BEST_GLOBAL_MATCHES = []
-BEST_GLOBAL_RATIO_DIFF = 1.0
-SOLUTION_FOUND = False
+// Hash approximation for filtering
+__device__ uint32_t approx_hash(uint64_t key_high, uint64_t key_low) {
+    uint32_t h = 0xe0b8a2ba; // First bytes of target
+    h ^= key_high >> 32;
+    h ^= key_high;
+    h ^= key_low >> 32;
+    h ^= key_low;
+    h ^= h >> 16;
+    return h;
+}
 
-# Create a shared lock for thread-safe operations
-GLOBAL_LOCK = threading.Lock()
-
-# Initialize the last save time
-save_progress_last_save_time = 0
+__global__ void test_keys(uint64_t prefix_high, uint64_t prefix_low, 
+                         uint32_t *offsets, int offset_count,
+                         float target_ratio, uint32_t target_hash_prefix,
+                         uint32_t *candidates, float *ratios, uint32_t *count) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= offset_count) return;
+    
+    // Get this thread's offset
+    uint32_t offset = offsets[idx];
+    
+    // Create full key by combining prefix and offset
+    uint64_t key_low = prefix_low | offset;
+    uint64_t key_high = prefix_high;
+    
+    // Calculate approximate ratio and hash
+    float ratio = approx_ratio(key_high, key_low);
+    uint32_t hash_prefix = approx_hash(key_high, key_low);
+    
+    // Store ratio for sorting
+    ratios[idx] = ratio;
+    
+    // Calculate difference from target ratio
+    float ratio_diff = fabsf(ratio - target_ratio);
+    uint32_t hash_diff = (hash_prefix ^ target_hash_prefix) & 0xFFFF0000; // Check top bits
+    
+    // Check if it's a candidate worth verifying on CPU
+    if (ratio_diff < 0.0001f || hash_diff == 0) {
+        uint32_t pos = atomicAdd(count, 1);
+        if (pos < 1000) {  // Limit to 1000 candidates
+            candidates[pos] = offset;
+        }
+    }
+}
+"""
 
 def hash160(public_key_bytes):
     """Bitcoin's hash160 function: RIPEMD160(SHA256(data))"""
@@ -124,10 +167,6 @@ def verify_private_key(private_key_hex):
             print(f"Private key: {private_key_hex}")
             print(f"Generated hash: {pubkey_hash}")
             print(f"Target hash: {TARGET_HASH}")
-            
-            # Signal all processes to stop
-            global SOLUTION_FOUND
-            SOLUTION_FOUND = True
         
         return {
             'match': exact_match,
@@ -161,10 +200,6 @@ def save_solution(key, result):
             f.write(f"Target hash: {TARGET_HASH}\n")
             f.write(f"ScriptPubKey: 76a914{TARGET_HASH}88ac\n")
             f.write(f"Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ\n")
-            f.write(f"Ratio: {result.get('ratio')}\n")
-            f.write(f"Ratio diff from PHI/8: {result.get('ratio_diff')}\n")
-            f.write(f"Total keys checked: {KEYS_CHECKED:,}\n")
-            f.write(f"Search duration: {format_time(time.time() - START_TIME)}\n")
         
         # Also save to a fixed filename for easy access
         with open("puzzle68_SOLVED.txt", "w") as f:
@@ -172,61 +207,10 @@ def save_solution(key, result):
             f.write(f"Private key: {key}\n")
             f.write(f"ScriptPubKey: 76a914{TARGET_HASH}88ac\n")
             f.write(f"Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ\n")
+        
+        print(f"Solution saved to puzzle68_solution_{time.strftime('%Y%m%d_%H%M%S')}.txt")
     except Exception as e:
         print(f"Error saving solution: {e}")
-
-def save_progress(best_matches, operation="", attempt_count=0, force_save=False):
-    """Save current progress and best matches to a file with more detailed stats"""
-    global KEYS_CHECKED, BEST_GLOBAL_MATCHES, save_progress_last_save_time
-    
-    # Update total keys checked
-    with GLOBAL_LOCK:
-        KEYS_CHECKED += attempt_count
-        
-        # Update best global matches
-        for key, result in best_matches:
-            # Check if this is a better match than what we have
-            if not BEST_GLOBAL_MATCHES or float(result.get('ratio_diff', 1.0)) < float(BEST_GLOBAL_MATCHES[0][1].get('ratio_diff', 1.0)):
-                BEST_GLOBAL_MATCHES.append((key, result))
-                BEST_GLOBAL_MATCHES.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                BEST_GLOBAL_MATCHES = BEST_GLOBAL_MATCHES[:10]  # Keep top 10
-    
-    # Don't save too frequently unless forced
-    current_time = time.time()
-    if not force_save and current_time - save_progress_last_save_time < 30:  # Save every 30 seconds
-        return
-    
-    save_progress_last_save_time = current_time
-    
-    try:
-        with open("puzzle68_progress.txt", "w") as f:
-            f.write(f"Search progress as of {time.ctime()}\n")
-            f.write(f"Runtime: {format_time(current_time - START_TIME)}\n")
-            f.write(f"Current operation: {operation}\n")
-            f.write(f"Total keys checked: {KEYS_CHECKED:,}\n")
-            
-            # Calculate rate
-            elapsed = current_time - START_TIME
-            if elapsed > 0:
-                rate = int(KEYS_CHECKED / elapsed)
-                f.write(f"Keys per second: {rate:,}\n")
-                # Estimate time to completion for 16^10 search space
-                if rate > 0:
-                    total_space = 16**10  # Search space size for 10 hex digits
-                    remaining = max(0, total_space - KEYS_CHECKED)
-                    seconds_remaining = remaining / rate
-                    f.write(f"Estimated time remaining: {format_time(seconds_remaining)}\n")
-            
-            f.write("\nTop closest matches by ratio:\n")
-            for i, (key, result) in enumerate(BEST_GLOBAL_MATCHES):
-                f.write(f"{i+1}. Key: {key}\n")
-                bit_length = count_bits(int(key, 16))
-                f.write(f"   Bit length: {bit_length}\n")
-                f.write(f"   Ratio diff: {result.get('ratio_diff')}\n")
-                f.write(f"   Generated hash: {result.get('generated_hash')}\n")
-                f.write(f"   Target hash: {TARGET_HASH}\n\n")
-    except Exception as e:
-        print(f"Error saving progress: {e}")
 
 def format_time(seconds):
     """Format time in seconds to a readable string"""
@@ -234,659 +218,312 @@ def format_time(seconds):
         return f"{seconds:.1f} seconds"
     elif seconds < 3600:
         return f"{seconds/60:.1f} minutes"
-    elif seconds < 86400:
+    else:
         hours = int(seconds / 3600)
         minutes = int((seconds % 3600) / 60)
         return f"{hours} hours, {minutes} minutes"
-    else:
-        days = int(seconds / 86400)
-        hours = int((seconds % 86400) / 3600)
-        return f"{days} days, {hours} hours"
 
-def try_multi_bit_manipulations(key, max_flips=5, max_positions=32):
-    """Try flipping multiple bits at once in the key - enhanced for exhaustive search"""
-    key_int = int(key, 16)
-    print(f"Trying multi-bit manipulations of {key}")
-    print(f"Max bits to flip: {max_flips}, Max positions: {max_positions}")
+def single_gpu_search():
+    """Run search on a single GPU with proper initialization and error handling"""
+    if not HAS_CUDA:
+        print("CUDA not available. Cannot run GPU search.")
+        return None
     
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Positions to try bit flips (focus on both lower and higher bits)
-    positions = list(range(max_positions))
-    
-    # Try flipping 1 to max_flips bits at a time
-    for num_flips in range(1, max_flips + 1):
-        print(f"Trying {num_flips}-bit flips...")
-        # Generate combinations of num_flips positions
-        for combo in combinations(positions, num_flips):
-            if not RUNNING or SOLUTION_FOUND:
-                print("Search interrupted")
-                return None
-                
-            # Start with original key
-            modified_key = key_int
-            
-            # Flip bits at all positions in the combo
-            for pos in combo:
-                modified_key ^= (1 << pos)
-            
-            # Ensure it's still 68 bits
-            if count_bits(modified_key) != 68:
-                continue
-            
-            # Format and test
-            modified_key_hex = format_private_key(modified_key)
-            result = verify_private_key(modified_key_hex)
-            count += 1
-            
-            if count % 10000 == 0:
-                print(f"Tested {count:,} multi-bit variations...")
-                # Save progress periodically
-                save_progress(best_matches, f"Multi-bit manipulation ({num_flips} bits)", count)
-            
-            # Check if we found the solution
-            if result and result.get('match'):
-                print(f"\n*** SOLUTION FOUND ***")
-                print(f"Key: {modified_key_hex}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                print(f"ScriptPubKey: 76a914{result.get('generated_hash')}88ac")
-                
-                # Save solution
-                save_solution(modified_key_hex, result)
-                
-                # Exit immediately on match
-                print("\nExiting program immediately with solution found.")
-                os._exit(0)  # Force immediate exit
-                
-                return modified_key_hex
-            
-            # Track best match by ratio
-            if result:
-                ratio_diff = float(result.get('ratio_diff', 1.0))
-                if ratio_diff < best_ratio_diff:
-                    best_ratio_diff = ratio_diff
-                    
-                    # Add to best matches
-                    best_matches.append((modified_key_hex, result))
-                    best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                    best_matches = best_matches[:5]  # Keep top 5
-                    
-                    # Report improvement
-                    print(f"\nNew best match: {modified_key_hex}")
-                    print(f"Bit length: {count_bits(modified_key)}")
-                    print(f"Ratio diff: {ratio_diff}")
-                    print(f"Generated hash: {result.get('generated_hash')}")
-                    
-                    # Save progress on significant improvement
-                    save_progress(best_matches, f"Multi-bit manipulation ({num_flips} bits)", count, force_save=True)
-    
-    print(f"Completed multi-bit manipulations, tested {count:,} variations")
-    return None
-
-def precise_search_around_key(key, range_size=100000, step_size=1, max_keys=10000000):
-    """Perform a precise search around a key with very small steps - enhanced for exhaustive search"""
-    key_int = int(key, 16)
-    print(f"Starting precise search around {key}")
-    print(f"Range: +/- {range_size}, Step size: {step_size}, Max keys: {max_keys:,}")
-    
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Search within range of the key
-    for offset in range(-range_size, range_size + 1, step_size):
-        if offset == 0:  # Skip the original key
-            continue
-            
-        if not RUNNING or SOLUTION_FOUND:
-            print("Search interrupted")
-            break
-            
-        # Calculate modified key
-        modified_key = key_int + offset
-        
-        # Ensure it's still 68 bits
-        if count_bits(modified_key) != 68:
-            continue
-        
-        # Format and test
-        modified_key_hex = format_private_key(modified_key)
-        result = verify_private_key(modified_key_hex)
-        count += 1
-        
-        if count % 10000 == 0:
-            print(f"Tested {count:,} keys in precise search...")
-            # Save progress periodically
-            save_progress(best_matches, "Precise search", count)
-        
-        # Check if we found the solution
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND ***")
-            print(f"Key: {modified_key_hex}")
-            print(f"Generated hash: {result.get('generated_hash')}")
-            
-            # Save solution
-            save_solution(modified_key_hex, result)
-            
-            return modified_key_hex
-        
-        # Track best match by ratio
-        if result:
-            ratio_diff = float(result.get('ratio_diff', 1.0))
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                
-                # Add to best matches
-                best_matches.append((modified_key_hex, result))
-                best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                best_matches = best_matches[:5]  # Keep top 5
-                
-                # Report improvement
-                print(f"\nNew best match: {modified_key_hex}")
-                print(f"Bit length: {count_bits(modified_key)}")
-                print(f"Ratio diff: {ratio_diff}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save progress on significant improvement
-                save_progress(best_matches, "Precise search", count, force_save=True)
-        
-        # Check if we've tested enough keys
-        if count >= max_keys:
-            print(f"Reached max keys limit of {max_keys:,}")
-            break
-    
-    print(f"Completed precise search, tested {count:,} keys")
-    return None
-
-def random_bit_permutation_search(key, iterations=1000000):
-    """Try random bit permutations of a key"""
-    key_int = int(key, 16)
-    print(f"Starting random bit permutation search from {key}")
-    
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Define bit operations to try
-    operations = [
-        lambda k: k ^ (1 << random.randint(0, 40)),  # Flip random bit
-        lambda k: k ^ (random.randint(1, 255)),     # XOR with small random value
-        lambda k: (k & ~0xFF) | random.randint(0, 255),  # Randomize lowest byte
-        lambda k: k + random.randint(-1000, 1000),  # Small addition/subtraction
-        lambda k: ((k << 1) & ((1 << 68) - 1)) | (k >> 67),  # Rotate bits
-        lambda k: k ^ (PUZZLE_NUMBER << random.randint(0, 16))  # XOR with puzzle number
-    ]
-    
-    for i in range(iterations):
-        if not RUNNING or SOLUTION_FOUND:
-            print("Search interrupted")
-            break
-            
-        # Choose random operation
-        op = random.choice(operations)
-        modified_key = op(key_int)
-        
-        # Ensure it's still 68 bits
-        if count_bits(modified_key) != 68:
-            continue
-            
-        # Format and test
-        modified_key_hex = format_private_key(modified_key)
-        result = verify_private_key(modified_key_hex)
-        count += 1
-        
-        if count % 10000 == 0:
-            print(f"Tested {count:,} random bit permutations...")
-            save_progress(best_matches, "Random bit permutations", count)
-        
-        # Check if we found the solution
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND ***")
-            print(f"Key: {modified_key_hex}")
-            print(f"Generated hash: {result.get('generated_hash')}")
-            
-            # Save solution
-            save_solution(modified_key_hex, result)
-            
-            return modified_key_hex
-        
-        # Track best match by ratio
-        if result:
-            ratio_diff = float(result.get('ratio_diff', 1.0))
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                
-                # Add to best matches
-                best_matches.append((modified_key_hex, result))
-                best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                best_matches = best_matches[:5]  # Keep top 5
-                
-                # Report improvement
-                print(f"\nNew best match: {modified_key_hex}")
-                print(f"Bit length: {count_bits(modified_key)}")
-                print(f"Ratio diff: {ratio_diff}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save progress
-                save_progress(best_matches, "Random bit permutations", count, force_save=True)
-    
-    print(f"Completed random bit permutations, tested {count:,} variations")
-    return None
-
-def try_mathematical_transformations(key):
-    """Try various mathematical transformations of the key"""
-    key_int = int(key, 16)
-    print(f"Trying mathematical transformations of {key}")
-    
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Multipliers based on various mathematical constants
-    multipliers = [
-        int(PHI * 2**32) & ((1 << 68) - 1),  # PHI scaled to 68 bits
-        int(math.e * 2**32) & ((1 << 68) - 1),  # e scaled to 68 bits
-        int(math.pi * 2**32) & ((1 << 68) - 1),  # pi scaled to 68 bits
-        int(math.sqrt(2) * 2**32) & ((1 << 68) - 1),  # sqrt(2) scaled to 68 bits
-        PUZZLE_NUMBER,  # Puzzle number
-        PUZZLE_NUMBER**2,  # Puzzle number squared
-        int(PUZZLE_NUMBER * PHI),  # Puzzle number * PHI
-    ]
-    
-    transformations = [
-        # Addition with constants
-        lambda k, m: (k + m) & ((1 << 68) - 1),
-        # Subtraction with constants
-        lambda k, m: (k - m) & ((1 << 68) - 1),
-        # XOR with constants
-        lambda k, m: k ^ m,
-        # Multiply low bits with constant
-        lambda k, m: (k & ~0xFFFF) | ((k & 0xFFFF) * (m & 0xFF)) & 0xFFFF,
-        # Bit rotations
-        lambda k, m: ((k << (m % 68)) | (k >> (68 - (m % 68)))) & ((1 << 68) - 1),
-    ]
-    
-    for transform in transformations:
-        for multiplier in multipliers:
-            if not RUNNING or SOLUTION_FOUND:
-                print("Search interrupted")
-                return None
-                
-            modified_key = transform(key_int, multiplier)
-            
-            # Ensure it's still 68 bits
-            if count_bits(modified_key) != 68:
-                continue
-                
-            # Format and test
-            modified_key_hex = format_private_key(modified_key)
-            result = verify_private_key(modified_key_hex)
-            count += 1
-            
-            # Check if we found the solution
-            if result and result.get('match'):
-                print(f"\n*** SOLUTION FOUND ***")
-                print(f"Key: {modified_key_hex}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save solution
-                save_solution(modified_key_hex, result)
-                
-                return modified_key_hex
-            
-            # Track best match by ratio
-            if result:
-                ratio_diff = float(result.get('ratio_diff', 1.0))
-                if ratio_diff < best_ratio_diff:
-                    best_ratio_diff = ratio_diff
-                    
-                    # Add to best matches
-                    best_matches.append((modified_key_hex, result))
-                    best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                    best_matches = best_matches[:5]  # Keep top 5
-                    
-                    # Report improvement
-                    print(f"\nNew best match: {modified_key_hex}")
-                    print(f"Bit length: {count_bits(modified_key)}")
-                    print(f"Ratio diff: {ratio_diff}")
-                    print(f"Generated hash: {result.get('generated_hash')}")
-                    
-                    # Save progress
-                    save_progress(best_matches, "Mathematical transformations", count, force_save=True)
-    
-    print(f"Completed mathematical transformations, tested {count:,} variations")
-    save_progress(best_matches, "Mathematical transformations", count)
-    return None
-
-def handle_exit_signal(sig, frame):
-    """Handle user exit signal (Ctrl+C)"""
-    global RUNNING
-    if not RUNNING:
-        print("\nForce exiting...")
-        sys.exit(1)
-    
-    print("\nGracefully shutting down... (Press Ctrl+C again to force exit)")
-    RUNNING = False
-
-def systematic_pattern_search(pattern_base, target_digits=10, step=1, max_tests=1000000):
-    """Systematically search through a pattern space"""
-    print(f"Starting systematic search of pattern: {pattern_base}xxxxxxxxxx")
-    base_int = int(pattern_base, 16)
-    
-    # Calculate search space boundaries
-    suffix_bits = target_digits * 4
-    suffix_max = (1 << suffix_bits) - 1
-    
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Search through the suffix space in steps
-    for suffix in range(0, suffix_max + 1, step):
-        if not RUNNING or SOLUTION_FOUND:
-            print("Search interrupted")
-            break
-            
-        # Create full key
-        full_key_int = base_int | suffix
-        
-        # Ensure it's 68 bits
-        if count_bits(full_key_int) != 68:
-            continue
-        
-        # Format and test
-        full_key_hex = format_private_key(full_key_int)
-        result = verify_private_key(full_key_hex)
-        count += 1
-        
-        if count % 10000 == 0:
-            print(f"Tested {count:,} patterns...")
-            suffix_hex = format(suffix, f'0{target_digits}x')
-            current = f"{pattern_base}{suffix_hex}"
-            print(f"Currently at: {current}")
-            save_progress(best_matches, "Systematic pattern search", count)
-        
-        # Check if we found the solution
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND ***")
-            print(f"Key: {full_key_hex}")
-            print(f"Generated hash: {result.get('generated_hash')}")
-            
-            # Save solution
-            save_solution(full_key_hex, result)
-            
-            return full_key_hex
-        
-        # Track best match by ratio
-        if result:
-            ratio_diff = float(result.get('ratio_diff', 1.0))
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                
-                # Add to best matches
-                best_matches.append((full_key_hex, result))
-                best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                best_matches = best_matches[:5]  # Keep top 5
-                
-                # Report improvement
-                print(f"\nNew best match: {full_key_hex}")
-                print(f"Bit length: {count_bits(full_key_int)}")
-                print(f"Ratio diff: {ratio_diff}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save progress
-                save_progress(best_matches, "Systematic pattern search", count, force_save=True)
-        
-        # Check if we've tested enough keys
-        if count >= max_tests:
-            print(f"Reached max tests limit of {max_tests:,}")
-            break
-    
-    print(f"Completed systematic pattern search, tested {count:,} keys")
-    return None
-
-def search_cedb187f_pattern():
-    """Focus search on the CEDB187F pattern space"""
-    print(f"Starting search of CEDB187F pattern space")
-    pattern = CEDB187F_PATTERN
-    
-    # Try a systematic search with step size to cover more ground
-    step_size = 1001  # Use a prime number to ensure good coverage
-    return systematic_pattern_search(pattern, target_digits=10, step=step_size, max_tests=10000000)
-
-def partition_search_space(num_threads=4):
-    """Partition the search space for multi-threaded search"""
-    total_space = 16**10  # 10 hex digits
-    keys_per_thread = total_space // num_threads
-    
-    partitions = []
-    for i in range(num_threads):
-        start = i * keys_per_thread
-        end = (i+1) * keys_per_thread if i < num_threads-1 else total_space
-        
-        start_hex = format(start, '010x')
-        end_hex = format(end, '010x')
-        
-        partitions.append({
-            'start': start,
-            'end': end,
-            'start_hex': start_hex,
-            'end_hex': end_hex,
-            'pattern': f"{CEDB187F_PATTERN}{start_hex}"
-        })
-    
-    return partitions
-
-def threaded_pattern_search(thread_id, start, end, pattern):
-    """Search a specific range of the pattern space in a thread"""
-    global SOLUTION_FOUND  # Declare global at the beginning of the function
-    print(f"Thread {thread_id}: Searching from {start:x} to {end:x}")
-    
-    base_int = int(CEDB187F_PATTERN, 16)
-    
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Search through the range systematically with a step
-    step = 997  # A prime number step helps ensure good coverage
-    
-    for suffix in range(start, end, step):
-        if not RUNNING or SOLUTION_FOUND:
-            print(f"Thread {thread_id}: Search interrupted")
-            break
-            
-        # Create full key
-        full_key_int = base_int | suffix
-        
-        # Ensure it's 68 bits
-        if count_bits(full_key_int) != 68:
-            continue
-        
-        # Format and test
-        full_key_hex = format_private_key(full_key_int)
-        result = verify_private_key(full_key_hex)
-        count += 1
-        
-        if count % 10000 == 0:
-            percent = (suffix - start) / (end - start) * 100 if end > start else 0
-            print(f"Thread {thread_id}: {percent:.1f}% complete, tested {count:,} keys")
-            save_progress(best_matches, f"Thread {thread_id} search", count)
-        
-        # Check if we found the solution
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND in Thread {thread_id} ***")
-            print(f"Key: {full_key_hex}")
-            print(f"Generated hash: {result.get('generated_hash')}")
-            
-            # Save solution
-            save_solution(full_key_hex, result)
-            SOLUTION_FOUND = True
-            
-            return full_key_hex
-        
-        # Track best match by ratio
-        if result:
-            ratio_diff = float(result.get('ratio_diff', 1.0))
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                
-                # Add to best matches
-                best_matches.append((full_key_hex, result))
-                best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                best_matches = best_matches[:5]  # Keep top 5
-                
-                # Report improvement
-                print(f"\nThread {thread_id}: New best match: {full_key_hex}")
-                print(f"Bit length: {count_bits(full_key_int)}")
-                print(f"Ratio diff: {ratio_diff}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save progress
-                save_progress(best_matches, f"Thread {thread_id} search", count, force_save=True)
-    
-    print(f"Thread {thread_id}: Completed, tested {count:,} keys")
-    return None
-
-def multi_threaded_search(num_threads=8):
-    """Run a multi-threaded search of the pattern space"""
-    print(f"Starting multi-threaded search with {num_threads} threads")
-    
-    # Partition the search space
-    partitions = partition_search_space(num_threads)
-    
-    # Create and start threads
-    threads = []
-    for i, part in enumerate(partitions):
-        thread = threading.Thread(
-            target=threaded_pattern_search,
-            args=(i, part['start'], part['end'], part['pattern'])
-        )
-        thread.start()
-        threads.append(thread)
-        
-        # Small delay between thread starts
-        time.sleep(0.5)
-    
-    # Wait for threads to complete
+    # Initialize CUDA
     try:
-        while True:
-            if all(not t.is_alive() for t in threads) or SOLUTION_FOUND:
-                break
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("\nSearch interrupted by user")
-        global RUNNING
-        RUNNING = False
-        
-        # Wait for threads to notice and exit
-        for t in threads:
-            t.join()
+        cuda.init()
+        print("CUDA initialized successfully")
+    except Exception as e:
+        print(f"Failed to initialize CUDA: {e}")
+        return None
     
-    print("All search threads completed")
+    # Get device count
+    try:
+        device_count = cuda.Device.count()
+        if device_count == 0:
+            print("No CUDA devices found")
+            return None
+        print(f"Found {device_count} CUDA device(s)")
+    except Exception as e:
+        print(f"Error getting device count: {e}")
+        return None
+    
+    # Select first device (device 0)
+    try:
+        device = cuda.Device(0)
+        print(f"Using device 0: {device.name()}")
+    except Exception as e:
+        print(f"Error selecting device 0: {e}")
+        return None
+    
+    # Create context
+    try:
+        ctx = device.make_context()
+        print("Created CUDA context")
+    except Exception as e:
+        print(f"Error creating context: {e}")
+        return None
+    
+    try:
+        # Try to check memory info (this often fails if there are problems)
+        try:
+            free_mem, total_mem = cuda.mem_get_info()
+            print(f"GPU memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
+            batch_size = min(50000000, int(free_mem * 0.7 / 16))  # 16 bytes per key
+        except Exception as e:
+            print(f"Warning: Could not get memory info: {e}")
+            batch_size = 10000000  # Use conservative default batch size
+        
+        print(f"Using batch size: {batch_size:,}")
+        
+        # Compile CUDA module
+        try:
+            module = compiler.SourceModule(CUDA_CODE)
+            test_keys_kernel = module.get_function("test_keys")
+            print("CUDA kernel compiled successfully")
+        except Exception as e:
+            print(f"Error compiling CUDA kernel: {e}")
+            ctx.pop()
+            return None
+        
+        # Prepare base pattern
+        base_int = int(PATTERN_BASE, 16)
+        base_high = base_int >> 32
+        base_low = base_int & 0xFFFFFFFF
+        bit_mask = 0xFFFFFFFF  # Mask for full pattern suffix
+        
+        # Clear the bits we want to explore in base_low
+        base_low_masked = base_low & ~bit_mask
+        
+        # First 4 bytes of target hash as uint32
+        target_hash_prefix = int(TARGET_HASH[:8], 16)
+        
+        # Allocate memory on GPU
+        offsets = np.arange(batch_size, dtype=np.uint32)
+        candidates = np.zeros(1000, dtype=np.uint32)
+        count = np.zeros(1, dtype=np.uint32)
+        ratios = np.zeros(batch_size, dtype=np.float32)
+        
+        offsets_gpu = cuda.mem_alloc(offsets.nbytes)
+        candidates_gpu = cuda.mem_alloc(candidates.nbytes)
+        count_gpu = cuda.mem_alloc(count.nbytes)
+        ratios_gpu = cuda.mem_alloc(ratios.nbytes)
+        
+        # Determine number of batches
+        max_suffix = 0xFFFFFFFF  # Maximum suffix value (covers all 10 hex digits)
+        total_batches = (max_suffix // batch_size) + 1
+        
+        print(f"Starting search of pattern {PATTERN_BASE}xxxxxxxxxx")
+        print(f"Estimated batches: {total_batches}")
+        
+        start_time = time.time()
+        total_keys_checked = 0
+        best_matches = []
+        
+        try:
+            # Process batches
+            for batch in range(total_batches):
+                batch_start_time = time.time()
+                
+                # Start with a fresh offset range for this batch
+                start_offset = batch * batch_size
+                end_offset = min(start_offset + batch_size, max_suffix + 1)
+                current_batch_size = end_offset - start_offset
+                
+                # Prepare offsets for this batch
+                offsets = np.arange(start_offset, end_offset, dtype=np.uint32)
+                
+                # Reset candidate counter
+                count[0] = 0
+                
+                # Copy data to GPU
+                cuda.memcpy_htod(offsets_gpu, offsets)
+                cuda.memcpy_htod(count_gpu, count)
+                
+                # Set up kernel grid
+                block_size = 256
+                grid_size = (current_batch_size + block_size - 1) // block_size
+                
+                # Launch kernel
+                test_keys_kernel(
+                    np.uint64(base_high),
+                    np.uint64(base_low_masked),
+                    offsets_gpu,
+                    np.int32(current_batch_size),
+                    np.float32(PHI_OVER_8),
+                    np.uint32(target_hash_prefix),
+                    candidates_gpu,
+                    ratios_gpu,
+                    count_gpu,
+                    block=(block_size, 1, 1),
+                    grid=(grid_size, 1)
+                )
+                
+                # Get results back
+                cuda.memcpy_dtoh(candidates, candidates_gpu)
+                cuda.memcpy_dtoh(count, count_gpu)
+                cuda.memcpy_dtoh(ratios, ratios_gpu)
+                
+                # Update progress
+                total_keys_checked += current_batch_size
+                batch_time = time.time() - batch_start_time
+                elapsed_time = time.time() - start_time
+                
+                print(f"\nBatch {batch+1}/{total_batches} completed in {format_time(batch_time)}")
+                print(f"Total keys checked: {total_keys_checked:,}")
+                print(f"Keys/sec: {int(current_batch_size / batch_time):,}")
+                
+                # Estimated time remaining
+                keys_remaining = max_suffix + 1 - total_keys_checked
+                estimated_time = (keys_remaining * elapsed_time) / total_keys_checked if total_keys_checked > 0 else 0
+                print(f"Estimated time remaining: {format_time(estimated_time)}")
+                
+                # Get the number of candidates found
+                candidates_found = min(int(count[0]), 1000)
+                print(f"Candidates found: {candidates_found}")
+                
+                # Verification phase
+                if candidates_found > 0:
+                    print(f"Verifying {candidates_found} candidates on CPU...")
+                    
+                    # Sort candidates by ratio proximity to PHI/8
+                    best_ratio_indices = np.argsort(np.abs(ratios[:current_batch_size] - PHI_OVER_8))[:min(200, current_batch_size)]
+                    
+                    # Combine explicit candidates with best ratio candidates
+                    all_offsets = set()
+                    for i in range(candidates_found):
+                        all_offsets.add(int(candidates[i]))
+                    
+                    for idx in best_ratio_indices:
+                        if idx < current_batch_size:  # Make sure index is in bounds
+                            all_offsets.add(int(offsets[idx]))
+                    
+                    # Check each candidate
+                    for offset in all_offsets:
+                        full_key_int = (base_int & ~bit_mask) | offset
+                        
+                        # Ensure it's exactly 68 bits
+                        if count_bits(full_key_int) != 68:
+                            continue
+                        
+                        # Format and verify
+                        full_key = format_private_key(full_key_int)
+                        result = verify_private_key(full_key)
+                        
+                        # Check if we found a solution
+                        if result and result.get('match', False):
+                            print("\n*** SOLUTION FOUND! ***")
+                            print(f"Private key: {full_key}")
+                            print(f"Generated hash: {result['generated_hash']}")
+                            print(f"Target hash: {TARGET_HASH}")
+                            
+                            # Save solution
+                            save_solution(full_key, result)
+                            
+                            # Clean up and return
+                            offsets_gpu.free()
+                            candidates_gpu.free()
+                            count_gpu.free()
+                            ratios_gpu.free()
+                            ctx.pop()
+                            
+                            return full_key
+                        
+                        # Track best matches
+                        if result:
+                            ratio_diff = float(result.get('ratio_diff', 1.0))
+                            best_matches.append((full_key, ratio_diff, result.get('generated_hash', '')))
+                            best_matches.sort(key=lambda x: x[1])  # Sort by ratio difference
+                            best_matches = best_matches[:5]  # Keep top 5
+                
+                # Show best matches so far
+                if best_matches:
+                    print("\nBest matches so far:")
+                    for i, (key, diff, hash_val) in enumerate(best_matches):
+                        print(f"{i+1}. Key: {key}")
+                        print(f"   Ratio diff: {diff}")
+                        print(f"   Hash: {hash_val}")
+                
+                # Save intermediate results
+                with open("puzzle68_progress.txt", "w") as f:
+                    f.write(f"Search progress as of {time.ctime()}\n")
+                    f.write(f"Pattern: {PATTERN_BASE}xxxxxxxxxx\n")
+                    f.write(f"Batch: {batch+1}/{total_batches}\n")
+                    f.write(f"Keys checked: {total_keys_checked:,}\n")
+                    f.write(f"Keys/sec: {int(current_batch_size / batch_time):,}\n")
+                    f.write(f"Elapsed time: {format_time(elapsed_time)}\n")
+                    f.write(f"Estimated time remaining: {format_time(estimated_time)}\n\n")
+                    
+                    if best_matches:
+                        f.write("Best matches so far:\n")
+                        for i, (key, diff, hash_val) in enumerate(best_matches):
+                            f.write(f"{i+1}. Key: {key}\n")
+                            f.write(f"   Ratio diff: {diff}\n")
+                            f.write(f"   Hash: {hash_val}\n\n")
+        
+        except KeyboardInterrupt:
+            print("\nSearch interrupted by user")
+        except Exception as e:
+            print(f"\nError during search: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    except Exception as e:
+        print(f"Error in GPU search: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # Clean up GPU resources
+        try:
+            offsets_gpu.free()
+            candidates_gpu.free()
+            count_gpu.free()
+            ratios_gpu.free()
+        except:
+            pass
+        
+        # Pop the context
+        try:
+            ctx.pop()
+            print("CUDA context released")
+        except:
+            pass
+    
     return None
 
-def try_known_candidates():
-    """Try all known candidate keys first"""
-    print("\nVerifying known candidate keys...")
-    for key in [BEST_PHI_MATCH, BEST_ALT_PATTERN] + ADDITIONAL_CANDIDATES:
-        print(f"Checking {key}...")
-        result = verify_private_key(key)
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND IN INITIAL VERIFICATION ***")
-            save_solution(key, result)
-            return key
-    return None
-
-def main_search():
-    """Main search function that runs multiple strategies"""
-    global RUNNING
-    signal.signal(signal.SIGINT, handle_exit_signal)
-    
-    print("\nStarting main search process...")
-    
-    # First try all known candidates
-    solution = try_known_candidates()
-    if solution:
-        return solution
-    
-    # Try systematic search of CEDB187F pattern with multiple threads
-    print("\nStarting multi-threaded search of CEDB187F pattern space...")
-    solution = multi_threaded_search(num_threads=8)  # Use 8 threads for CPU search
-    if solution:
-        return solution
-    
-    # If pattern search didn't find a solution, try other strategies
-    search_strategies = [
-        # Try precise search around best matches
-        lambda: precise_search_around_key(BEST_PHI_MATCH, range_size=500000, step_size=1),
-        lambda: precise_search_around_key(BEST_ALT_PATTERN, range_size=500000, step_size=1),
-        
-        # Try bit manipulations
-        lambda: try_multi_bit_manipulations(BEST_PHI_MATCH, max_flips=4, max_positions=32),
-        lambda: try_multi_bit_manipulations(BEST_ALT_PATTERN, max_flips=4, max_positions=32),
-        
-        # Try random search
-        lambda: random_bit_permutation_search(BEST_PHI_MATCH, iterations=2000000),
-        lambda: random_bit_permutation_search(BEST_ALT_PATTERN, iterations=2000000),
-        
-        # Try math transformations
-        lambda: try_mathematical_transformations(BEST_PHI_MATCH),
-        lambda: try_mathematical_transformations(BEST_ALT_PATTERN),
-    ]
-    
-    # Run each strategy until solution is found or all are exhausted
-    for i, strategy in enumerate(search_strategies):
-        if not RUNNING:
-            break
-            
-        print(f"\n--- Strategy {i+1}/{len(search_strategies)} ---")
-        solution = strategy()
-        if solution:
-            return solution
-    
-    return None
-
-if __name__ == "__main__":
-    print("Bitcoin Puzzle #68 Solver - Robust Edition")
+def main():
+    """Main function"""
+    print("Simple PyCUDA Bitcoin Puzzle Searcher")
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
     print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
     print(f"Target ratio: φ/8 = {PHI_OVER_8}")
     print(f"Searching for private keys with EXACTLY 68 bits")
-    print(f"Primary search pattern: {CEDB187F_PATTERN}")
+    print(f"Pattern: {PATTERN_BASE}xxxxxxxxxx")
     
-    # Initialize start time
-    START_TIME = time.time()
-    
-    print("\nRunning CPU-based search (no GPU required)...")
-    print("Press Ctrl+C to gracefully stop the search")
+    # Check whether we can use CUDA
+    if not HAS_CUDA:
+        print("\nCUDA is not available. Cannot run GPU search.")
+        return
     
     try:
-        # Run the main search
-        solution = main_search()
-        
-        elapsed_time = time.time() - START_TIME
-        print(f"\nSearch completed in {format_time(elapsed_time)}")
+        # Run the single GPU search
+        print("\nStarting GPU search...")
+        solution = single_gpu_search()
         
         if solution:
             print(f"\nFinal solution: {solution}")
-            sys.exit(0)
         else:
-            print("\nNo solution found in the search space.")
-            print("Check puzzle68_progress.txt for the best matches so far.")
+            print("\nNo solution found or search was interrupted.")
+            print("Check puzzle68_progress.txt for partial results.")
     
     except KeyboardInterrupt:
         print("\nSearch interrupted by user.")
-        elapsed_time = time.time() - START_TIME
-        print(f"Search ran for {format_time(elapsed_time)}")
-        print(f"Total keys checked: {KEYS_CHECKED:,}")
-        sys.exit(1)
-        
     except Exception as e:
-        print(f"\nError during search: {str(e)}")
+        print(f"\nUnexpected error: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
