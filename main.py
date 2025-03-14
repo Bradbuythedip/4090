@@ -1,16 +1,15 @@
-# multi_pattern_cuda_search.py
-# Searches multiple pattern spaces exhaustively for Bitcoin Puzzle #68
+# brute_force_puzzle68.py
+# Systematically searches the entire 68-bit key space for Bitcoin Puzzle #68
 
 import hashlib
 import binascii
 import time
 import sys
+import os
 import numpy as np
 from mpmath import mp, mpf, fabs
 import ecdsa
 from ecdsa import SECP256k1, SigningKey
-import argparse
-import os
 
 # Import PyCUDA modules with proper error handling
 try:
@@ -32,26 +31,6 @@ PHI = mpf('1.6180339887498948482045868343656381177203091798057628621354486227052
 TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubKey
 PUZZLE_NUMBER = 68
 PHI_OVER_8 = float(PHI / 8)  # Convert to float for GPU compatibility
-
-# Pattern spaces to search
-PATTERNS = [
-    # Primary search pattern - already searched
-    {"pattern": "00000000000000000000000000000000000000000000000cedb187f", "comment": "CEDB187F pattern", "searched": True},
-    
-    # Key patterns with close phi/8 ratios
-    {"pattern": "00000000000000000000000000000000000000000000000041a01b90", "comment": "PHI_MATCH base", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000cedb187e", "comment": "CEDB187E (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000cedb187d", "comment": "CEDB187D (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000cedb1870", "comment": "CEDB1870 (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000cedb186f", "comment": "CEDB186F (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000cedb087f", "comment": "CEDB087F (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000cedb387f", "comment": "CEDB387F (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000ced3187f", "comment": "CED3187F (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000ceda187f", "comment": "CEDA187F (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000c6db187f", "comment": "C6DB187F (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000dedb187f", "comment": "DEDB187F (1 bit difference)", "searched": False},
-    {"pattern": "00000000000000000000000000000000000000000000000467a98b1", "comment": "Additional candidate pattern", "searched": False}
-]
 
 # CUDA kernel for testing keys
 CUDA_CODE = """
@@ -82,7 +61,7 @@ __device__ uint32_t approx_hash(uint64_t key_high, uint64_t key_low) {
     return h;
 }
 
-__global__ void test_keys(uint64_t prefix_high, uint64_t prefix_low, 
+__global__ void test_keys(uint64_t start_high, uint64_t start_low, 
                          uint32_t *offsets, int offset_count,
                          float target_ratio, uint32_t target_hash_prefix,
                          uint32_t *candidates, float *ratios, uint32_t *count) {
@@ -92,9 +71,12 @@ __global__ void test_keys(uint64_t prefix_high, uint64_t prefix_low,
     // Get this thread's offset
     uint32_t offset = offsets[idx];
     
-    // Create full key by combining prefix and offset
-    uint64_t key_low = prefix_low | offset;
-    uint64_t key_high = prefix_high;
+    // Create full key by adding offset
+    uint64_t key_low = start_low + offset;
+    uint64_t key_high = start_high;
+    if (key_low < start_low) {  // Handle overflow
+        key_high++;
+    }
     
     // Calculate approximate ratio and hash
     float ratio = approx_ratio(key_high, key_low);
@@ -105,10 +87,10 @@ __global__ void test_keys(uint64_t prefix_high, uint64_t prefix_low,
     
     // Calculate difference from target ratio
     float ratio_diff = fabsf(ratio - target_ratio);
-    uint32_t hash_diff = (hash_prefix ^ target_hash_prefix) & 0xFFFF0000; // Check top bits
+    uint32_t hash_diff = (hash_prefix ^ target_hash_prefix);
     
     // Check if it's a candidate worth verifying on CPU
-    if (ratio_diff < 0.0001f || hash_diff == 0) {
+    if (ratio_diff < 0.0005f || (hash_diff & 0xFFFF0000) == 0) {
         uint32_t pos = atomicAdd(count, 1);
         if (pos < 1000) {  // Limit to 1000 candidates
             candidates[pos] = offset;
@@ -237,13 +219,21 @@ def format_time(seconds):
         return f"{seconds:.1f} seconds"
     elif seconds < 3600:
         return f"{seconds/60:.1f} minutes"
-    else:
+    elif seconds < 86400:
         hours = int(seconds / 3600)
         minutes = int((seconds % 3600) / 60)
         return f"{hours} hours, {minutes} minutes"
+    else:
+        days = int(seconds / 86400)
+        hours = int((seconds % 86400) / 3600)
+        return f"{days} days, {hours} hours"
 
-def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id=0):
-    """Search a specific pattern space using GPU acceleration"""
+def format_large_int(n):
+    """Format large integers with commas for readability"""
+    return f"{n:,}"
+
+def brute_force_search(start_key=None, batch_size=50000000, device_id=0):
+    """Search the 68-bit key space systematically"""
     if not HAS_CUDA:
         print("CUDA not available. Cannot run GPU search.")
         return None
@@ -307,17 +297,35 @@ def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id
             ctx.pop()
             return None
         
-        # Prepare base pattern
-        base_int = int(pattern_base, 16)
-        base_high = base_int >> 32
-        base_low = base_int & 0xFFFFFFFF
+        # Calculate key space boundaries
+        max_68bit = (1 << 68) - 1  # Maximum 68-bit value
+        if start_key is None:
+            # Try to load last position from progress file
+            if os.path.exists("puzzle68_brute_force_progress.txt"):
+                try:
+                    with open("puzzle68_brute_force_progress.txt", "r") as f:
+                        start_key = int(f.readline().strip(), 16)
+                        print(f"Resuming from key: {format_private_key(start_key)}")
+                except:
+                    print("Could not read progress file, starting from 0")
+                    start_key = 0
+            else:
+                start_key = 0
         
-        # Calculate bit mask for suffix digits
-        suffix_bits = suffix_digits * 4
-        bit_mask = (1 << suffix_bits) - 1
+        if start_key > max_68bit:
+            print(f"Start key exceeds 68-bit range. Setting to maximum 68-bit value.")
+            start_key = max_68bit
         
-        # Clear the bits we want to explore in base_low
-        base_low_masked = base_low & ~bit_mask
+        print(f"Starting search at key: {format_private_key(start_key)}")
+        print(f"Maximum 68-bit key: {format_private_key(max_68bit)}")
+        
+        # Calculate total search space and progress
+        total_space = max_68bit + 1  # Total number of 68-bit keys
+        search_space_left = max_68bit - start_key + 1
+        progress_pct = (1 - (search_space_left / total_space)) * 100
+        print(f"Total search space: {format_large_int(total_space)} keys")
+        print(f"Search space remaining: {format_large_int(search_space_left)} keys")
+        print(f"Progress: {progress_pct:.8f}%")
         
         # First 4 bytes of target hash as uint32
         target_hash_prefix = int(TARGET_HASH[:8], 16)
@@ -333,49 +341,25 @@ def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id
         count_gpu = cuda.mem_alloc(count.nbytes)
         ratios_gpu = cuda.mem_alloc(ratios.nbytes)
         
-        # Determine number of batches
-        max_suffix = (1 << suffix_bits) - 1
-        total_batches = (max_suffix // batch_size) + 1
-        
-        print(f"Starting search of pattern {pattern_base + 'x'*suffix_digits}")
-        print(f"Suffix space size: {max_suffix+1:,} ({suffix_digits} hex digits)")
-        print(f"Estimated batches: {total_batches}")
-        
-        # Create/update progress tracking file for this pattern
-        pattern_progress_file = f"pattern_{pattern_base}_progress.txt"
-        if os.path.exists(pattern_progress_file):
-            try:
-                with open(pattern_progress_file, 'r') as f:
-                    last_batch = int(f.readline().strip())
-                    print(f"Resuming from batch {last_batch+1}/{total_batches}")
-                    start_batch = last_batch + 1
-            except:
-                print("Could not read progress file, starting from batch 0")
-                start_batch = 0
-        else:
-            start_batch = 0
-        
-        # Save initial progress
-        with open(pattern_progress_file, 'w') as f:
-            f.write(str(start_batch - 1) + "\n")
-        
         start_time = time.time()
-        total_keys_checked = start_batch * batch_size
+        current_key = start_key
+        total_keys_checked = 0
         best_matches = []
         
-        # Main search loop
         try:
-            # Process batches
-            for batch in range(start_batch, total_batches):
+            # Process batches until we reach the end of 68-bit range
+            while current_key <= max_68bit:
                 batch_start_time = time.time()
                 
-                # Start with a fresh offset range for this batch
-                start_offset = batch * batch_size
-                end_offset = min(start_offset + batch_size, max_suffix + 1)
-                current_batch_size = end_offset - start_offset
+                # Calculate actual batch size (might be smaller near the end)
+                current_batch_size = min(batch_size, max_68bit - current_key + 1)
+                
+                # Split the current key into high and low parts
+                current_key_high = current_key >> 32
+                current_key_low = current_key & 0xFFFFFFFF
                 
                 # Prepare offsets for this batch
-                offsets = np.arange(start_offset, end_offset, dtype=np.uint32)
+                offsets = np.arange(min(current_batch_size, batch_size), dtype=np.uint32)
                 
                 # Reset candidate counter
                 count[0] = 0
@@ -390,8 +374,8 @@ def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id
                 
                 # Launch kernel
                 test_keys_kernel(
-                    np.uint64(base_high),
-                    np.uint64(base_low_masked),
+                    np.uint64(current_key_high),
+                    np.uint64(current_key_low),
                     offsets_gpu,
                     np.int32(current_batch_size),
                     np.float32(PHI_OVER_8),
@@ -413,18 +397,32 @@ def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id
                 batch_time = time.time() - batch_start_time
                 elapsed_time = time.time() - start_time
                 
-                # Save batch progress
-                with open(pattern_progress_file, 'w') as f:
-                    f.write(str(batch) + "\n")
+                # Update current key for next batch
+                current_key += current_batch_size
                 
-                print(f"\nBatch {batch+1}/{total_batches} completed in {format_time(batch_time)}")
-                print(f"Total keys checked: {total_keys_checked:,}")
+                # Save progress
+                with open("puzzle68_brute_force_progress.txt", "w") as f:
+                    f.write(format_private_key(current_key) + "\n")
+                
+                # Calculate progress
+                search_space_left = max_68bit - current_key + 1
+                progress_pct = (1 - (search_space_left / total_space)) * 100
+                
+                print(f"\nBatch completed in {format_time(batch_time)}")
+                print(f"Current key: {format_private_key(current_key)}")
+                print(f"Total keys checked: {format_large_int(total_keys_checked)}")
                 print(f"Keys/sec: {int(current_batch_size / batch_time):,}")
+                print(f"Progress: {progress_pct:.8f}%")
                 
                 # Estimated time remaining
-                keys_remaining = max_suffix + 1 - total_keys_checked
-                estimated_time = (keys_remaining * elapsed_time) / total_keys_checked if total_keys_checked > 0 else 0
-                print(f"Estimated time remaining: {format_time(estimated_time)}")
+                if search_space_left > 0 and total_keys_checked > 0:
+                    keys_per_sec = total_keys_checked / elapsed_time
+                    estimated_time_remaining = search_space_left / keys_per_sec
+                    print(f"Estimated time remaining: {format_time(estimated_time_remaining)}")
+                    
+                    # Also estimate total search time
+                    estimated_total_time = total_space / keys_per_sec
+                    print(f"Estimated total search time: {format_time(estimated_total_time)}")
                 
                 # Get the number of candidates found
                 candidates_found = min(int(count[0]), 1000)
@@ -446,43 +444,45 @@ def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id
                         if idx < current_batch_size:  # Make sure index is in bounds
                             all_offsets.add(int(offsets[idx]))
                     
-                    # Check each candidate
+                    # Check each candidate - adjust base key for this batch
+                    batch_base_key = current_key - current_batch_size
                     for offset in all_offsets:
-                        full_key_int = (base_int & ~bit_mask) | offset
-                        
-                        # Ensure it's exactly 68 bits
-                        if count_bits(full_key_int) != 68:
-                            continue
-                        
-                        # Format and verify
-                        full_key = format_private_key(full_key_int)
-                        result = verify_private_key(full_key)
-                        
-                        # Check if we found a solution
-                        if result and result.get('match', False):
-                            print("\n*** SOLUTION FOUND! ***")
-                            print(f"Private key: {full_key}")
-                            print(f"Generated hash: {result['generated_hash']}")
-                            print(f"Target hash: {TARGET_HASH}")
+                        if offset < current_batch_size:  # Make sure offset is valid
+                            full_key_int = batch_base_key + offset
                             
-                            # Save solution
-                            save_solution(full_key, result)
+                            # Ensure it's exactly 68 bits
+                            if count_bits(full_key_int) != 68:
+                                continue
                             
-                            # Clean up and return
-                            offsets_gpu.free()
-                            candidates_gpu.free()
-                            count_gpu.free()
-                            ratios_gpu.free()
-                            ctx.pop()
+                            # Format and verify
+                            full_key = format_private_key(full_key_int)
+                            result = verify_private_key(full_key)
                             
-                            return full_key
-                        
-                        # Track best matches
-                        if result:
-                            ratio_diff = float(result.get('ratio_diff', 1.0))
-                            best_matches.append((full_key, ratio_diff, result.get('generated_hash', '')))
-                            best_matches.sort(key=lambda x: x[1])  # Sort by ratio difference
-                            best_matches = best_matches[:5]  # Keep top 5
+                            # Check if we found a solution
+                            if result and result.get('match', False):
+                                print("\n*** SOLUTION FOUND! ***")
+                                print(f"Private key: {full_key}")
+                                print(f"Generated hash: {result['generated_hash']}")
+                                print(f"Target hash: {TARGET_HASH}")
+                                
+                                # Save solution
+                                save_solution(full_key, result)
+                                
+                                # Clean up and return
+                                offsets_gpu.free()
+                                candidates_gpu.free()
+                                count_gpu.free()
+                                ratios_gpu.free()
+                                ctx.pop()
+                                
+                                return full_key
+                            
+                            # Track best matches
+                            if result:
+                                ratio_diff = float(result.get('ratio_diff', 1.0))
+                                best_matches.append((full_key, ratio_diff, result.get('generated_hash', '')))
+                                best_matches.sort(key=lambda x: x[1])  # Sort by ratio difference
+                                best_matches = best_matches[:5]  # Keep top 5
                 
                 # Show best matches so far
                 if best_matches:
@@ -492,26 +492,32 @@ def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id
                         print(f"   Ratio diff: {diff}")
                         print(f"   Hash: {hash_val}")
                 
-                # Save overall progress for all patterns
-                with open("puzzle68_multi_pattern_progress.txt", "a") as f:
-                    f.write(f"Pattern {pattern_base + 'x'*suffix_digits} - {time.ctime()}\n")
-                    f.write(f"Batch: {batch+1}/{total_batches}\n")
-                    f.write(f"Keys checked: {total_keys_checked:,}\n")
-                    f.write(f"Progress: {total_keys_checked/(max_suffix+1)*100:.2f}%\n\n")
+                # Save detailed progress
+                with open("puzzle68_brute_force_details.txt", "w") as f:
+                    f.write(f"Search progress as of {time.ctime()}\n")
+                    f.write(f"Current key: {format_private_key(current_key)}\n")
+                    f.write(f"Total keys checked: {format_large_int(total_keys_checked)}\n")
+                    f.write(f"Progress: {progress_pct:.8f}%\n")
+                    f.write(f"Keys/sec: {int(current_batch_size / batch_time):,}\n")
+                    f.write(f"Elapsed time: {format_time(elapsed_time)}\n")
+                    if search_space_left > 0 and total_keys_checked > 0:
+                        keys_per_sec = total_keys_checked / elapsed_time
+                        estimated_time_remaining = search_space_left / keys_per_sec
+                        f.write(f"Estimated time remaining: {format_time(estimated_time_remaining)}\n\n")
+                    
+                    if best_matches:
+                        f.write("Best matches so far:\n")
+                        for i, (key, diff, hash_val) in enumerate(best_matches):
+                            f.write(f"{i+1}. Key: {key}\n")
+                            f.write(f"   Ratio diff: {diff}\n")
+                            f.write(f"   Hash: {hash_val}\n\n")
             
-            print(f"\nCompleted search of pattern {pattern_base + 'x'*suffix_digits}")
-            print(f"Total keys checked: {total_keys_checked:,}")
+            print("\nCompleted search of entire 68-bit key space")
+            print(f"No solution found for puzzle 68")
             
-            # Mark this pattern as searched
-            with open("patterns_searched.txt", "a") as f:
-                f.write(f"{pattern_base}\n")
-        
         except KeyboardInterrupt:
             print("\nSearch interrupted by user")
-            # Save the last completed batch for resuming later
-            with open(pattern_progress_file, 'w') as f:
-                f.write(str(batch) + "\n")
-        
+            
         except Exception as e:
             print(f"\nError during search: {e}")
             import traceback
@@ -542,43 +548,13 @@ def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id
     return None
 
 def main():
-    """Main function with command line argument parsing"""
-    parser = argparse.ArgumentParser(description="Multi-Pattern Bitcoin Puzzle Searcher")
-    parser.add_argument("--pattern", type=str, help="Specific pattern to search (hex prefix)")
-    parser.add_argument("--suffix-digits", type=int, default=8, help="Number of suffix hex digits to search (default: 8)")
-    parser.add_argument("--device", type=int, default=0, help="CUDA device ID to use (default: 0)")
-    parser.add_argument("--batch-size", type=int, default=50000000, help="Batch size (default: 50M)")
-    parser.add_argument("--list", action="store_true", help="List available patterns and exit")
-    parser.add_argument("--all", action="store_true", help="Search all patterns sequentially")
-    args = parser.parse_args()
-    
-    print("Multi-Pattern Bitcoin Puzzle Searcher")
+    """Main function"""
+    print("Brute Force Bitcoin Puzzle #68 Solver")
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
     print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
     print(f"Target ratio: φ/8 = {PHI_OVER_8}")
     print(f"Searching for private keys with EXACTLY 68 bits")
-    
-    # Load list of patterns already searched
-    searched_patterns = set()
-    if os.path.exists("patterns_searched.txt"):
-        with open("patterns_searched.txt", "r") as f:
-            for line in f:
-                pattern = line.strip()
-                if pattern:
-                    searched_patterns.add(pattern)
-    
-    # Update the patterns list with the patterns we've already searched
-    for i in range(len(PATTERNS)):
-        PATTERNS[i]["searched"] = PATTERNS[i]["pattern"] in searched_patterns
-    
-    # If --list specified, just list the patterns and exit
-    if args.list:
-        print("\nAvailable patterns to search:")
-        for i, pattern_info in enumerate(PATTERNS):
-            status = "SEARCHED" if pattern_info["searched"] else "NOT SEARCHED"
-            print(f"{i+1}. {pattern_info['pattern']} - {pattern_info['comment']} - {status}")
-        return
     
     # Check whether we can use CUDA
     if not HAS_CUDA:
@@ -586,60 +562,17 @@ def main():
         return
     
     try:
-        if args.pattern:
-            # Search a specific pattern
-            print(f"\nSearching specific pattern: {args.pattern}")
-            solution = search_pattern(
-                args.pattern, 
-                suffix_digits=args.suffix_digits,
-                batch_size=args.batch_size,
-                device_id=args.device
-            )
-            
-            if solution:
-                print(f"\nFinal solution: {solution}")
-            else:
-                print("\nNo solution found or search was interrupted.")
+        # Run the brute force search
+        print("\nStarting brute force search of 68-bit key space...")
+        print("Press Ctrl+C to pause (progress will be saved)")
         
-        elif args.all:
-            # Search all patterns that haven't been searched yet
-            for pattern_info in PATTERNS:
-                if not pattern_info["searched"]:
-                    print(f"\nSearching pattern: {pattern_info['pattern']} - {pattern_info['comment']}")
-                    solution = search_pattern(
-                        pattern_info["pattern"],
-                        suffix_digits=args.suffix_digits,
-                        batch_size=args.batch_size,
-                        device_id=args.device
-                    )
-                    
-                    if solution:
-                        print(f"\nFinal solution: {solution}")
-                        return
-                    
-                    print("\nMoving to next pattern...")
-            
-            print("\nAll patterns searched without finding a solution.")
+        solution = brute_force_search()
         
+        if solution:
+            print(f"\nFinal solution: {solution}")
         else:
-            # Pick the first unsearched pattern
-            unsearched_patterns = [p for p in PATTERNS if not p["searched"]]
-            if unsearched_patterns:
-                pattern_info = unsearched_patterns[0]
-                print(f"\nSearching next unsearched pattern: {pattern_info['pattern']} - {pattern_info['comment']}")
-                solution = search_pattern(
-                    pattern_info["pattern"],
-                    suffix_digits=args.suffix_digits,
-                    batch_size=args.batch_size,
-                    device_id=args.device
-                )
-                
-                if solution:
-                    print(f"\nFinal solution: {solution}")
-                else:
-                    print("\nNo solution found or search was interrupted.")
-            else:
-                print("\nAll patterns have been searched. Use --pattern to specify a custom pattern.")
+            print("\nNo solution found or search was interrupted.")
+            print("Check puzzle68_brute_force_progress.txt to resume later.")
     
     except KeyboardInterrupt:
         print("\nSearch interrupted by user.")
