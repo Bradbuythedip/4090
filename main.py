@@ -1,4 +1,4 @@
-# puzzle68_exhaustive_solver.py
+# puzzle68_rtx4090_solver.py
 
 import hashlib
 import binascii
@@ -15,6 +15,9 @@ import signal
 import sys
 import multiprocessing as mp
 from datetime import datetime, timedelta
+import concurrent.futures
+import queue
+import threading
 
 # GPU libraries
 import pycuda.driver as cuda
@@ -30,16 +33,13 @@ TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubK
 PUZZLE_NUMBER = 68
 PHI_OVER_8 = float(PHI / 8)  # Convert to float for GPU compatibility
 
-# Our best candidates from different approaches
-BEST_PHI_MATCH = "00000000000000000000000000000000000000000000000041a01b90c5b886dc"
-BEST_ALT_PATTERN = "00000000000000000000000000000000000000000000000cedb187f001bdffd2"
-
-# Additional promising candidates (randomly generated examples - should be replaced with actual good candidates)
-ADDITIONAL_CANDIDATES = [
-    "00000000000000000000000000000000000000000000000041a01b90c5b886dd",  # Small variation of PHI_MATCH
-    "00000000000000000000000000000000000000000000000cedb187f001bdffe",   # Small variation of ALT_PATTERN
-    "00000000000000000000000000000000000000000000000467a98b1c3d2e5f0",   # Additional candidate
-    "00000000000000000000000000000000000000000000000789abcdef0123456",   # Additional candidate
+# Our best candidates from different approaches - focusing on cedb187f pattern as requested
+BASE_PATTERN = "00000000000000000000000000000000000000000000000cedb187f"
+SEARCH_MASKS = [
+    0xffffffffff,  # Full 10-digit mask
+    0xffffffff00,  # Fixed last byte, search the rest
+    0xffffff0000,  # Fixed last two bytes, search the rest
+    0xffff000000,  # Fixed last three bytes, search the rest
 ]
 
 # Global variables for runtime control
@@ -48,17 +48,18 @@ START_TIME = time.time()
 KEYS_CHECKED = 0
 BEST_GLOBAL_MATCHES = []
 BEST_GLOBAL_RATIO_DIFF = 1.0
+SOLUTION_FOUND = False
 
 # Create a shared lock for thread-safe operations
-import threading
 GLOBAL_LOCK = threading.Lock()
+RESULT_QUEUE = queue.Queue()
 
-# CUDA kernel for testing keys - improved with more sophisticated filtering
+# CUDA kernel for testing keys - optimized for RTX 4090
 cuda_code = """
 #include <stdio.h>
 #include <stdint.h>
 
-// Improved ratio approximation function
+// Fast ratio approximation function optimized for RTX 4090
 __device__ float approx_ratio(uint64_t key_high, uint64_t key_low) {
     // This is a better approximation for filtering
     float result = 0.0f;
@@ -85,6 +86,7 @@ __device__ uint32_t approx_hash(uint64_t key_high, uint64_t key_low) {
     return h;
 }
 
+// Advanced key testing with multi-filter approach
 __global__ void test_keys(uint64_t prefix_high, uint64_t prefix_low, 
                          uint32_t *offsets, int offset_count,
                          float target_ratio, uint32_t target_hash_prefix,
@@ -108,40 +110,51 @@ __global__ void test_keys(uint64_t prefix_high, uint64_t prefix_low,
     
     // Calculate difference from target ratio
     float ratio_diff = fabsf(ratio - target_ratio);
-    uint32_t hash_diff = (hash_prefix ^ target_hash_prefix) & 0xFFFF0000; // Check top bits
+    uint32_t hash_diff = (hash_prefix ^ target_hash_prefix);
     
-    // Use multiple filtering criteria to identify promising candidates
+    // Advanced candidacy criteria
     bool is_candidate = false;
     
-    // Criterion 1: Ratio is extremely close to PHI/8
-    if (ratio_diff < 0.00001f) {
+    // Criterion 1: Extremely close ratio match
+    if (ratio_diff < 0.000005f) {
         is_candidate = true;
     }
     
-    // Criterion 2: Hash prefix matches
-    if (hash_diff == 0) {
+    // Criterion 2: Close ratio with matching high hash bits
+    if (ratio_diff < 0.0001f && (hash_diff & 0xFFFF0000) == 0) {
         is_candidate = true;
     }
     
-    // Criterion 3: Certain bit patterns in the hash are present
+    // Criterion 3: Good ratio with strong hash pattern match
+    if (ratio_diff < 0.001f && (hash_diff & 0xFFFFF000) == 0) {
+        is_candidate = true;
+    }
+    
+    // Criterion 4: Hash prefix matches target exactly
+    if ((hash_diff & 0xFFFFFF00) == 0) {
+        is_candidate = true;
+    }
+    
+    // Criterion 5: Hash has pattern similarities
     if ((hash_prefix & 0xF0F0F0F0) == (target_hash_prefix & 0xF0F0F0F0)) {
         is_candidate = true;
     }
     
-    // Store candidate if it meets any of our criteria
+    // Store candidate
     if (is_candidate) {
         uint32_t pos = atomicAdd(count, 1);
-        if (pos < 1000) {  // Limit to 1000 candidates
+        if (pos < 2000) {  // Increased from 1000 for RTX 4090
             candidates[pos] = offset;
         }
     }
 }
 
-// Additional kernel for range search with mutations
-__global__ void test_keys_with_mutations(uint64_t base_high, uint64_t base_low, 
-                                       uint32_t range_start, uint32_t keys_per_thread,
-                                       float target_ratio, uint32_t target_hash_prefix,
-                                       uint32_t *candidates, float *ratios, uint32_t *count) {
+// Aggressive testing with mutations - takes advantage of RTX 4090's compute power
+__global__ void test_keys_aggressive(uint64_t prefix_high, uint64_t prefix_low, 
+                                    uint32_t range_start, uint32_t keys_per_thread,
+                                    float target_ratio, uint32_t target_hash_prefix,
+                                    uint32_t *candidates, float *ratios, uint32_t *count,
+                                    uint32_t puzzle_num) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t start_offset = range_start + (idx * keys_per_thread);
     
@@ -149,30 +162,38 @@ __global__ void test_keys_with_mutations(uint64_t base_high, uint64_t base_low,
         uint32_t offset = start_offset + i;
         
         // Create key with offset
-        uint64_t key_low = base_low | offset;
-        uint64_t key_high = base_high;
+        uint64_t key_low = prefix_low | offset;
+        uint64_t key_high = prefix_high;
         
-        // Try some mutations
-        for (int mutation = 0; mutation < 4; mutation++) {
+        // Try several mutations per key
+        for (int mutation = 0; mutation < 8; mutation++) {
             uint64_t mutated_low = key_low;
             uint64_t mutated_high = key_high;
             
-            // Apply different mutations
+            // Apply mutations - more aggressive for RTX 4090
             switch(mutation) {
-                case 0: 
-                    // No mutation, original key
+                case 0: // Original key
                     break;
-                case 1: 
-                    // Flip a low bit
+                case 1: // Flip a low bit
                     mutated_low ^= 1;
                     break;
-                case 2: 
-                    // Flip a medium bit
+                case 2: // Flip a medium bit
                     mutated_low ^= (1 << 8);
                     break;
-                case 3: 
-                    // XOR with puzzle number
-                    mutated_low ^= 68;
+                case 3: // XOR with puzzle number
+                    mutated_low ^= puzzle_num;
+                    break;
+                case 4: // Rotate bits
+                    mutated_low = ((mutated_low << 1) | (mutated_low >> 31)) & 0xFFFFFFFF;
+                    break;
+                case 5: // Add puzzle number
+                    mutated_low += puzzle_num;
+                    break;
+                case 6: // XOR with rotated puzzle number
+                    mutated_low ^= (puzzle_num << 8);
+                    break;
+                case 7: // Combination
+                    mutated_low = ((mutated_low + puzzle_num) ^ (puzzle_num << 4)) & 0xFFFFFFFF;
                     break;
             }
             
@@ -184,10 +205,10 @@ __global__ void test_keys_with_mutations(uint64_t base_high, uint64_t base_low,
             float ratio_diff = fabsf(ratio - target_ratio);
             uint32_t hash_diff = (hash_prefix ^ target_hash_prefix);
             
-            // Check if it's a candidate worth verifying on CPU
-            if (ratio_diff < 0.0001f || (hash_diff & 0xFFFF0000) == 0) {
+            // More aggressive filtering for faster discovery
+            if ((ratio_diff < 0.0001f) || (hash_diff & 0xFFF00000) == 0) {
                 uint32_t pos = atomicAdd(count, 1);
-                if (pos < 1000) {  // Limit to 1000 candidates
+                if (pos < 2000) {
                     candidates[pos] = offset;
                     ratios[pos] = ratio;
                 }
@@ -197,10 +218,35 @@ __global__ void test_keys_with_mutations(uint64_t base_high, uint64_t base_low,
 }
 """
 
-# Compile CUDA kernel
-mod = SourceModule(cuda_code)
-test_keys_kernel = mod.get_function("test_keys")
-test_keys_with_mutations_kernel = mod.get_function("test_keys_with_mutations")
+def setup_gpu(gpu_id):
+    """Set up a specific GPU for computation"""
+    try:
+        cuda.init()
+        device = cuda.Device(gpu_id)
+        context = device.make_context()
+        module = SourceModule(cuda_code)
+        test_keys_kernel = module.get_function("test_keys")
+        test_keys_aggressive_kernel = module.get_function("test_keys_aggressive")
+        print(f"GPU {gpu_id} initialized: {device.name()}")
+        
+        return {
+            'device': device,
+            'context': context,
+            'module': module,
+            'test_keys': test_keys_kernel,
+            'test_keys_aggressive': test_keys_aggressive_kernel
+        }
+    except Exception as e:
+        print(f"Error initializing GPU {gpu_id}: {e}")
+        return None
+
+def release_gpu(gpu_data):
+    """Release GPU resources"""
+    if gpu_data and 'context' in gpu_data:
+        try:
+            gpu_data['context'].pop()
+        except Exception as e:
+            print(f"Error releasing GPU: {e}")
 
 def hash160(public_key_bytes):
     """Bitcoin's hash160 function: RIPEMD160(SHA256(data))"""
@@ -241,7 +287,6 @@ def get_pubkey_from_privkey(private_key_hex):
             'ratio': mpf(x) / mpf(y)  # Calculate with high precision
         }
     except Exception as e:
-        # print(f"Error generating public key: {e}")
         return None
 
 def verify_private_key(private_key_hex):
@@ -271,6 +316,10 @@ def verify_private_key(private_key_hex):
             print(f"Private key: {private_key_hex}")
             print(f"Generated hash: {pubkey_hash}")
             print(f"Target hash: {TARGET_HASH}")
+            
+            # Signal all processes to stop
+            global SOLUTION_FOUND
+            SOLUTION_FOUND = True
         
         return {
             'match': exact_match,
@@ -335,7 +384,7 @@ def save_progress(best_matches, operation="", attempt_count=0, force_save=False)
     
     # Don't save too frequently unless forced
     current_time = time.time()
-    if not force_save and current_time - save_progress.last_save_time < 60:  # Save at most once per minute
+    if not force_save and current_time - save_progress.last_save_time < 30:  # Save every 30 seconds
         return
     
     save_progress.last_save_time = current_time
@@ -373,496 +422,240 @@ def format_time(seconds):
         minutes = int((seconds % 3600) / 60)
         return f"{hours} hours, {minutes} minutes"
 
-def try_multi_bit_manipulations(key, max_flips=5, max_positions=32):
-    """Try flipping multiple bits at once in the key - enhanced for exhaustive search"""
-    key_int = int(key, 16)
-    print(f"Trying multi-bit manipulations of {key}")
-    print(f"Max bits to flip: {max_flips}, Max positions: {max_positions}")
+def gpu_search_with_pattern(gpu_id, base_pattern, bit_mask, batch_size=50000000, max_batches=100):
+    """GPU search focusing on a specific pattern, optimized for RTX 4090"""
+    # Convert pattern to int
+    base_int = int(base_pattern, 16)
     
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Positions to try bit flips (focus on both lower and higher bits)
-    positions = list(range(max_positions))
-    
-    # Try flipping 1 to max_flips bits at a time
-    for num_flips in range(1, max_flips + 1):
-        print(f"Trying {num_flips}-bit flips...")
-        # Generate combinations of num_flips positions
-        for combo in combinations(positions, num_flips):
-            # Start with original key
-            modified_key = key_int
-            
-            # Flip bits at all positions in the combo
-            for pos in combo:
-                modified_key ^= (1 << pos)
-            
-            # Ensure it's still 68 bits
-            if count_bits(modified_key) != 68:
-                continue
-            
-            # Format and test
-            modified_key_hex = format_private_key(modified_key)
-            result = verify_private_key(modified_key_hex)
-            count += 1
-            
-            if count % 10000 == 0:
-                print(f"Tested {count:,} multi-bit variations...")
-                # Save progress periodically
-                save_progress(best_matches, f"Multi-bit manipulation ({num_flips} bits)", count)
-            
-            # Check if we found the solution
-            if result and result.get('match'):
-                print(f"\n*** SOLUTION FOUND ***")
-                print(f"Key: {modified_key_hex}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                print(f"ScriptPubKey: 76a914{result.get('generated_hash')}88ac")
-                
-                # Save solution
-                save_solution(modified_key_hex, result)
-                
-                # Exit immediately on match
-                print("\nExiting program immediately with solution found.")
-                os._exit(0)  # Force immediate exit
-                
-                return modified_key_hex
-            
-            # Track best match by ratio
-            if result:
-                ratio_diff = float(result.get('ratio_diff', 1.0))
-                if ratio_diff < best_ratio_diff:
-                    best_ratio_diff = ratio_diff
-                    
-                    # Add to best matches
-                    best_matches.append((modified_key_hex, result))
-                    best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                    best_matches = best_matches[:5]  # Keep top 5
-                    
-                    # Report improvement
-                    print(f"\nNew best match: {modified_key_hex}")
-                    print(f"Bit length: {count_bits(modified_key)}")
-                    print(f"Ratio diff: {ratio_diff}")
-                    print(f"Generated hash: {result.get('generated_hash')}")
-                    
-                    # Save progress on significant improvement
-                    save_progress(best_matches, f"Multi-bit manipulation ({num_flips} bits)", count, force_save=True)
-    
-    print(f"Completed multi-bit manipulations, tested {count:,} variations")
-    return None
-
-def precise_search_around_key(key, range_size=100000, step_size=1, max_keys=10000000):
-    """Perform a precise search around a key with very small steps - enhanced for exhaustive search"""
-    key_int = int(key, 16)
-    print(f"Starting precise search around {key}")
-    print(f"Range: +/- {range_size}, Step size: {step_size}, Max keys: {max_keys:,}")
-    
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Search within range of the key
-    for offset in range(-range_size, range_size + 1, step_size):
-        if offset == 0:  # Skip the original key
-            continue
-            
-        # Calculate modified key
-        modified_key = key_int + offset
-        
-        # Ensure it's still 68 bits
-        if count_bits(modified_key) != 68:
-            continue
-        
-        # Format and test
-        modified_key_hex = format_private_key(modified_key)
-        result = verify_private_key(modified_key_hex)
-        count += 1
-        
-        if count % 10000 == 0:
-            print(f"Tested {count:,} keys in precise search...")
-            # Save progress periodically
-            save_progress(best_matches, "Precise search", count)
-        
-        # Check if we found the solution
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND ***")
-            print(f"Key: {modified_key_hex}")
-            print(f"Generated hash: {result.get('generated_hash')}")
-            
-            # Save solution
-            save_solution(modified_key_hex, result)
-            
-            return modified_key_hex
-        
-        # Track best match by ratio
-        if result:
-            ratio_diff = float(result.get('ratio_diff', 1.0))
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                
-                # Add to best matches
-                best_matches.append((modified_key_hex, result))
-                best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                best_matches = best_matches[:5]  # Keep top 5
-                
-                # Report improvement
-                print(f"\nNew best match: {modified_key_hex}")
-                print(f"Bit length: {count_bits(modified_key)}")
-                print(f"Ratio diff: {ratio_diff}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save progress on significant improvement
-                save_progress(best_matches, "Precise search", count, force_save=True)
-        
-        # Check if we've tested enough keys
-        if count >= max_keys:
-            print(f"Reached max keys limit of {max_keys:,}")
-            break
-        
-        # Check if we should continue running
-        if not RUNNING:
-            print("Search interrupted")
-            break
-    
-    print(f"Completed precise search, tested {count:,} keys")
-    return None
-
-def gpu_search_with_dual_focus(base_int, batch_size=10000000, max_batches=100, bit_mask=0x0000FFFF):
-    """GPU search with focus on both ratio and hash pattern - enhanced for exhaustive search"""
-    # Convert base_int to Python int to avoid overflow
-    base_int = int(base_int)
-    
-    # Determine optimal batch size based on GPU memory
-    free_mem, total_mem = cuda.mem_get_info()
-    max_possible_batch = int(free_mem * 0.7 / 16)  # 16 bytes per key (estimated)
-    if batch_size > max_possible_batch:
-        batch_size = max_possible_batch
-        print(f"Adjusted batch size to {batch_size:,} based on GPU memory")
-    
-    # Track best matches
-    best_matches = []
-    best_ratio_diff = 1.0
-    total_keys_checked = 0
-    found_solution = False
-    
-    # Split the base key
-    base_high = base_int >> 32
-    base_low = base_int & 0xFFFFFFFF
-    
-    # Clear the bits we want to explore
-    base_low_masked = base_low & ~bit_mask
-    
-    print(f"GPU search around: {format_private_key(base_int)}")
-    print(f"Bit length: {count_bits(base_int)}")
-    print(f"Using batch size: {batch_size:,}")
-    
-    # First 4 bytes of target hash as uint32
-    target_hash_prefix = int(TARGET_HASH[:8], 16)
-    
-    # Allocate memory on GPU
-    offsets = np.arange(batch_size, dtype=np.uint32)
-    candidates = np.zeros(1000, dtype=np.uint32)
-    count = np.zeros(1, dtype=np.uint32)
-    ratios = np.zeros(batch_size, dtype=np.float32)
-    
-    offsets_gpu = cuda.mem_alloc(offsets.nbytes)
-    candidates_gpu = cuda.mem_alloc(candidates.nbytes)
-    count_gpu = cuda.mem_alloc(count.nbytes)
-    ratios_gpu = cuda.mem_alloc(ratios.nbytes)
-    
-    for batch in range(max_batches):
-        if found_solution or not RUNNING:
-            break
-            
-        # Start with a fresh offset range for this batch
-        start_offset = batch * batch_size
-        offsets = np.arange(start_offset, start_offset + batch_size, dtype=np.uint32) & bit_mask
-        
-        # Reset candidate counter
-        count[0] = 0
-        
-        # Copy data to GPU
-        cuda.memcpy_htod(offsets_gpu, offsets)
-        cuda.memcpy_htod(count_gpu, count)
-        
-        # Set up kernel grid
-        block_size = 256
-        grid_size = (batch_size + block_size - 1) // block_size
-        
-        # Launch kernel with hash prefix checking
-        test_keys_kernel(
-            np.uint64(base_high),
-            np.uint64(base_low_masked),
-            offsets_gpu,
-            np.int32(batch_size),
-            np.float32(PHI_OVER_8),
-            np.uint32(target_hash_prefix),
-            candidates_gpu,
-            ratios_gpu,
-            count_gpu,
-            block=(block_size, 1, 1),
-            grid=(grid_size, 1)
-        )
-        
-        # Get results back
-        cuda.memcpy_dtoh(candidates, candidates_gpu)
-        cuda.memcpy_dtoh(count, count_gpu)
-        cuda.memcpy_dtoh(ratios, ratios_gpu)
-        
-        total_keys_checked += batch_size
-        
-        # Report progress
-        print(f"\nBatch {batch+1}/{max_batches} completed")
-        print(f"Keys checked: {total_keys_checked:,}")
-        
-        # Get the number of candidates found
-        candidates_found = min(int(count[0]), 1000)
-        print(f"Candidates found: {candidates_found}")
-        
-        # Find the best ratios directly from the GPU results
-        best_indices = np.argsort(np.abs(ratios - PHI_OVER_8))[:200]  # Check top 200 instead of 100
-        
-        # Combine candidates from both methods
-        all_candidates = []
-        
-        # Add explicit candidates
-        for i in range(candidates_found):
-            offset = candidates[i]
-            all_candidates.append(offset)
-            
-        # Add best ratio candidates
-        for idx in best_indices:
-            offset = offsets[idx]
-            if offset not in all_candidates:
-                all_candidates.append(offset)
-        
-        # Verify the most promising candidates on CPU with high precision
-        print(f"Verifying {len(all_candidates)} candidates on CPU...")
-        
-        for offset in all_candidates:
-            # Use Python integers for bitwise operations to avoid overflow
-            offset_int = int(offset)
-            
-            # Create full key by applying the offset to the base
-            full_key_int = (base_int & ~bit_mask) | offset_int
-            
-            # Format the key
-            full_key = format_private_key(full_key_int)
-            
-            # Quick check: ensure it has exactly 68 bits
-            if count_bits(full_key_int) != 68:
-                continue
-                
-            # Verify with high precision
-            result = verify_private_key(full_key)
-            
-            # Check if we found the solution
-            if result and result.get('match'):
-                print(f"\n*** SOLUTION FOUND ***")
-                print(f"Key: {full_key}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                print(f"Target hash: {TARGET_HASH}")
-                
-                # Save solution
-                save_solution(full_key, result)
-                
-                found_solution = True
-                best_matches.append((full_key, result))
-                break
-            
-            # Track best match by ratio
-            if result:
-                ratio_diff = float(result.get('ratio_diff', 1.0))
-                if ratio_diff < best_ratio_diff:
-                    best_ratio_diff = ratio_diff
-                    
-                    # Add to best matches
-                    best_matches.append((full_key, result))
-                    best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                    best_matches = best_matches[:5]  # Keep top 5
-                    
-                    # Report improvement
-                    print(f"\nNew best match: {full_key}")
-                    print(f"Bit length: {count_bits(full_key_int)}")
-                    print(f"Ratio diff: {ratio_diff}")
-                    print(f"Generated hash: {result.get('generated_hash')}")
-                    
-                    if ratio_diff < 1e-10:
-                        print("EXTREMELY CLOSE MATCH FOUND!")
-                    
-                    # Save progress on significant improvement
-                    save_progress(best_matches, f"GPU dual search", total_keys_checked, force_save=True)
-        
-        # Save progress after each batch
-        save_progress(best_matches, f"GPU dual search", total_keys_checked)
-    
-    # Free GPU memory
-    offsets_gpu.free()
-    candidates_gpu.free()
-    count_gpu.free()
-    ratios_gpu.free()
-    
-    if found_solution and best_matches:
-        return best_matches[0][0]
-    elif best_matches:
-        return None  # Continue searching
-    else:
+    # Set up GPU
+    gpu_data = setup_gpu(gpu_id)
+    if not gpu_data:
         return None
-
-def random_bit_permutation_search(key, iterations=1000000):
-    """Try random bit permutations of a key"""
-    key_int = int(key, 16)
-    print(f"Starting random bit permutation search from {key}")
     
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Define bit operations to try
-    operations = [
-        lambda k: k ^ (1 << random.randint(0, 40)),  # Flip random bit
-        lambda k: k ^ (random.randint(1, 255)),     # XOR with small random value
-        lambda k: (k & ~0xFF) | random.randint(0, 255),  # Randomize lowest byte
-        lambda k: k + random.randint(-1000, 1000),  # Small addition/subtraction
-        lambda k: ((k << 1) & ((1 << 68) - 1)) | (k >> 67),  # Rotate bits
-        lambda k: k ^ (PUZZLE_NUMBER << random.randint(0, 16))  # XOR with puzzle number
-    ]
-    
-    for i in range(iterations):
-        if not RUNNING:
-            break
-            
-        # Choose random operation
-        op = random.choice(operations)
-        modified_key = op(key_int)
+    try:
+        # Make GPU context current
+        gpu_data['context'].push()
         
-        # Ensure it's still 68 bits
-        if count_bits(modified_key) != 68:
-            continue
-            
-        # Format and test
-        modified_key_hex = format_private_key(modified_key)
-        result = verify_private_key(modified_key_hex)
-        count += 1
+        # Determine optimal batch size based on GPU memory
+        free_mem, total_mem = cuda.mem_get_info()
+        max_possible_batch = int(free_mem * 0.8 / 16)  # 16 bytes per key (estimated)
+        if batch_size > max_possible_batch:
+            batch_size = max_possible_batch
+            print(f"GPU {gpu_id}: Adjusted batch size to {batch_size:,} based on GPU memory")
         
-        if count % 10000 == 0:
-            print(f"Tested {count:,} random bit permutations...")
-            save_progress(best_matches, "Random bit permutations", count)
+        # Track best matches
+        best_matches = []
+        best_ratio_diff = 1.0
+        total_keys_checked = 0
+        found_solution = False
         
-        # Check if we found the solution
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND ***")
-            print(f"Key: {modified_key_hex}")
-            print(f"Generated hash: {result.get('generated_hash')}")
-            
-            # Save solution
-            save_solution(modified_key_hex, result)
-            
-            return modified_key_hex
+        # Split the base key
+        base_high = base_int >> 32
+        base_low = base_int & 0xFFFFFFFF
         
-        # Track best match by ratio
-        if result:
-            ratio_diff = float(result.get('ratio_diff', 1.0))
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                
-                # Add to best matches
-                best_matches.append((modified_key_hex, result))
-                best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                best_matches = best_matches[:5]  # Keep top 5
-                
-                # Report improvement
-                print(f"\nNew best match: {modified_key_hex}")
-                print(f"Bit length: {count_bits(modified_key)}")
-                print(f"Ratio diff: {ratio_diff}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save progress
-                save_progress(best_matches, "Random bit permutations", count, force_save=True)
-    
-    print(f"Completed random bit permutations, tested {count:,} variations")
-    return None
-
-def try_mathematical_transformations(key):
-    """Try various mathematical transformations of the key"""
-    key_int = int(key, 16)
-    print(f"Trying mathematical transformations of {key}")
-    
-    best_matches = []
-    best_ratio_diff = 1.0
-    count = 0
-    
-    # Multipliers based on various mathematical constants
-    multipliers = [
-        int(PHI * 2**32) & ((1 << 68) - 1),  # PHI scaled to 68 bits
-        int(math.e * 2**32) & ((1 << 68) - 1),  # e scaled to 68 bits
-        int(math.pi * 2**32) & ((1 << 68) - 1),  # pi scaled to 68 bits
-        int(math.sqrt(2) * 2**32) & ((1 << 68) - 1),  # sqrt(2) scaled to 68 bits
-        PUZZLE_NUMBER,  # Puzzle number
-        PUZZLE_NUMBER**2,  # Puzzle number squared
-        int(PUZZLE_NUMBER * PHI),  # Puzzle number * PHI
-    ]
-    
-    transformations = [
-        # Addition with constants
-        lambda k, m: (k + m) & ((1 << 68) - 1),
-        # Subtraction with constants
-        lambda k, m: (k - m) & ((1 << 68) - 1),
-        # XOR with constants
-        lambda k, m: k ^ m,
-        # Multiply low bits with constant
-        lambda k, m: (k & ~0xFFFF) | ((k & 0xFFFF) * (m & 0xFF)) & 0xFFFF,
-        # Bit rotations
-        lambda k, m: ((k << (m % 68)) | (k >> (68 - (m % 68)))) & ((1 << 68) - 1),
-    ]
-    
-    for transform in transformations:
-        for multiplier in multipliers:
-            modified_key = transform(key_int, multiplier)
+        # Clear the bits we want to explore
+        base_low_masked = base_low & ~bit_mask
+        
+        print(f"GPU {gpu_id}: Search around: {format_private_key(base_int)}")
+        print(f"GPU {gpu_id}: Bit length: {count_bits(base_int)}")
+        print(f"GPU {gpu_id}: Using batch size: {batch_size:,}")
+        
+        # First 4 bytes of target hash as uint32
+        target_hash_prefix = int(TARGET_HASH[:8], 16)
+        
+        # Allocate memory on GPU - larger for RTX 4090
+        offsets = np.arange(batch_size, dtype=np.uint32)
+        candidates = np.zeros(2000, dtype=np.uint32)  # Increased from 1000
+        count = np.zeros(1, dtype=np.uint32)
+        ratios = np.zeros(batch_size, dtype=np.float32)
+        
+        offsets_gpu = cuda.mem_alloc(offsets.nbytes)
+        candidates_gpu = cuda.mem_alloc(candidates.nbytes)
+        count_gpu = cuda.mem_alloc(count.nbytes)
+        ratios_gpu = cuda.mem_alloc(ratios.nbytes)
+        
+        # Configure grid size for RTX 4090
+        block_size = 512  # Increased from 256 for RTX 4090
+        
+        batch = 0
+        while batch < max_batches and not (found_solution or SOLUTION_FOUND):
+            # Start with a fresh offset range for this batch
+            start_offset = batch * batch_size
+            offsets = np.arange(start_offset, start_offset + batch_size, dtype=np.uint32) & bit_mask
             
-            # Ensure it's still 68 bits
-            if count_bits(modified_key) != 68:
-                continue
-                
-            # Format and test
-            modified_key_hex = format_private_key(modified_key)
-            result = verify_private_key(modified_key_hex)
-            count += 1
+            # Reset candidate counter
+            count[0] = 0
             
-            # Check if we found the solution
-            if result and result.get('match'):
-                print(f"\n*** SOLUTION FOUND ***")
-                print(f"Key: {modified_key_hex}")
-                print(f"Generated hash: {result.get('generated_hash')}")
-                
-                # Save solution
-                save_solution(modified_key_hex, result)
-                
-                return modified_key_hex
+            # Copy data to GPU
+            cuda.memcpy_htod(offsets_gpu, offsets)
+            cuda.memcpy_htod(count_gpu, count)
             
-            # Track best match by ratio
-            if result:
-                ratio_diff = float(result.get('ratio_diff', 1.0))
-                if ratio_diff < best_ratio_diff:
-                    best_ratio_diff = ratio_diff
+            # Set up kernel grid
+            grid_size = (batch_size + block_size - 1) // block_size
+            
+            # Alternate between kernels for diversity
+            if batch % 2 == 0:
+                # Standard kernel
+                gpu_data['test_keys'](
+                    np.uint64(base_high),
+                    np.uint64(base_low_masked),
+                    offsets_gpu,
+                    np.int32(batch_size),
+                    np.float32(PHI_OVER_8),
+                    np.uint32(target_hash_prefix),
+                    candidates_gpu,
+                    ratios_gpu,
+                    count_gpu,
+                    block=(block_size, 1, 1),
+                    grid=(grid_size, 1)
+                )
+            else:
+                # Aggressive kernel - process fewer keys but more mutations per key
+                keys_per_thread = 8  # Each thread handles 8 keys with 8 mutations each
+                smaller_batch = batch_size // keys_per_thread
+                smaller_grid_size = (smaller_batch + block_size - 1) // block_size
+                
+                gpu_data['test_keys_aggressive'](
+                    np.uint64(base_high),
+                    np.uint64(base_low_masked),
+                    np.uint32(start_offset),
+                    np.uint32(keys_per_thread),
+                    np.float32(PHI_OVER_8),
+                    np.uint32(target_hash_prefix),
+                    candidates_gpu,
+                    ratios_gpu,
+                    count_gpu,
+                    np.uint32(PUZZLE_NUMBER),
+                    block=(block_size, 1, 1),
+                    grid=(smaller_grid_size, 1)
+                )
+            
+            # Get results back
+            cuda.memcpy_dtoh(candidates, candidates_gpu)
+            cuda.memcpy_dtoh(count, count_gpu)
+            cuda.memcpy_dtoh(ratios, ratios_gpu)
+            
+            total_keys_checked += batch_size
+            
+            # Report progress
+            candidates_found = min(int(count[0]), 2000)
+            if candidates_found > 0 or batch % 10 == 0:
+                print(f"\nGPU {gpu_id}: Batch {batch+1}/{max_batches} completed")
+                print(f"GPU {gpu_id}: Keys checked: {total_keys_checked:,}")
+                print(f"GPU {gpu_id}: Candidates found: {candidates_found}")
+            
+            # Find the best ratio candidates directly from GPU results
+            best_indices = np.argsort(np.abs(ratios - PHI_OVER_8))[:250]  # Check more candidates
+            
+            # Combine candidates from both methods
+            all_candidates = []
+            
+            # Add explicit candidates
+            for i in range(candidates_found):
+                offset = candidates[i]
+                all_candidates.append(offset)
+                
+            # Add best ratio candidates
+            for idx in best_indices:
+                offset = offsets[idx]
+                if offset not in all_candidates:
+                    all_candidates.append(offset)
+            
+            # Verify the most promising candidates on CPU with high precision
+            local_candidates_verified = 0
+            for offset in all_candidates:
+                # Check if solution has been found by another thread
+                if SOLUTION_FOUND:
+                    break
                     
-                    # Add to best matches
-                    best_matches.append((modified_key_hex, result))
-                    best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
-                    best_matches = best_matches[:5]  # Keep top 5
+                # Use Python integers for bitwise operations to avoid overflow
+                offset_int = int(offset)
+                
+                # Create full key by applying the offset to the base
+                full_key_int = (base_int & ~bit_mask) | offset_int
+                
+                # Format the key
+                full_key = format_private_key(full_key_int)
+                
+                # Quick check: ensure it has exactly 68 bits
+                if count_bits(full_key_int) != 68:
+                    continue
                     
-                    # Report improvement
-                    print(f"\nNew best match: {modified_key_hex}")
-                    print(f"Bit length: {count_bits(modified_key)}")
-                    print(f"Ratio diff: {ratio_diff}")
+                # Verify with high precision
+                result = verify_private_key(full_key)
+                local_candidates_verified += 1
+                
+                # Check if we found the solution
+                if result and result.get('match'):
+                    print(f"\n*** SOLUTION FOUND ON GPU {gpu_id} ***")
+                    print(f"Key: {full_key}")
                     print(f"Generated hash: {result.get('generated_hash')}")
+                    print(f"ScriptPubKey: 76a914{result.get('generated_hash')}88ac")
                     
-                    # Save progress
-                    save_progress(best_matches, "Mathematical transformations", count, force_save=True)
+                    # Save solution
+                    save_solution(full_key, result)
+                    
+                    # Add to result queue to signal other processes
+                    RESULT_QUEUE.put((full_key, result))
+                    found_solution = True
+                    SOLUTION_FOUND = True
+                    
+                    # Exit immediately on match
+                    print("\nExiting program immediately with solution found.")
+                    os._exit(0)
+                    
+                    break
+                
+                # Track best match by ratio
+                if result:
+                    ratio_diff = float(result.get('ratio_diff', 1.0))
+                    if ratio_diff < best_ratio_diff:
+                        best_ratio_diff = ratio_diff
+                        
+                        # Add to best matches
+                        best_matches.append((full_key, result))
+                        best_matches.sort(key=lambda x: float(x[1].get('ratio_diff', 1.0)))
+                        best_matches = best_matches[:5]  # Keep top 5
+                        
+                        # Report improvement
+                        print(f"\nGPU {gpu_id}: New best match: {full_key}")
+                        print(f"Bit length: {count_bits(full_key_int)}")
+                        print(f"Ratio diff: {ratio_diff}")
+                        print(f"Generated hash: {result.get('generated_hash')}")
+                        
+                        if ratio_diff < 1e-10:
+                            print("EXTREMELY CLOSE MATCH FOUND!")
+                        
+                        # Save progress on significant improvement
+                        save_progress(best_matches, f"GPU {gpu_id} search", total_keys_checked, force_save=True)
+            
+            # Save progress every 10 batches
+            if batch % 10 == 0:
+                save_progress(best_matches, f"GPU {gpu_id} search", total_keys_checked)
+                
+            # Report verification stats
+            if local_candidates_verified > 0:
+                print(f"GPU {gpu_id}: Verified {local_candidates_verified} candidates on CPU")
+                
+            batch += 1
+        
+        # Free GPU memory
+        offsets_gpu.free()
+        candidates_gpu.free()
+        count_gpu.free()
+        ratios_gpu.free()
+        
+        return best_matches
     
-    print(f"Completed mathematical transformations, tested {count:,} variations")
-    save_progress(best_matches, "Mathematical transformations", count)
-    return None
+    except Exception as e:
+        print(f"Error in GPU {gpu_id} search: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+    
+    finally:
+        # Release GPU
+        release_gpu(gpu_data)
 
 def handle_exit_signal(sig, frame):
     """Handle user exit signal (Ctrl+C)"""
@@ -874,143 +667,233 @@ def handle_exit_signal(sig, frame):
     print("\nGracefully shutting down... (Press Ctrl+C again to force exit)")
     RUNNING = False
 
-def exhaustive_search():
-    """Run a comprehensive exhaustive search using all strategies in a continuous loop"""
-    global RUNNING
-    signal.signal(signal.SIGINT, handle_exit_signal)  # Register Ctrl+C handler
+def distribute_masks_to_gpus(gpus, masks):
+    """Distribute search masks to GPUs for parallel search"""
+    distributions = []
     
-    # First, verify if any of our initial candidates already match
-    print("\nVerifying initial candidate keys...")
-    for key in [BEST_PHI_MATCH, BEST_ALT_PATTERN] + ADDITIONAL_CANDIDATES:
-        print(f"Checking {key}...")
-        result = verify_private_key(key)
-        if result and result.get('match'):
-            print(f"\n*** SOLUTION FOUND IN INITIAL VERIFICATION ***")
-            save_solution(key, result)
-            return key
+    # First, assign primary masks to GPUs
+    for i, mask in enumerate(masks):
+        if i < len(gpus):
+            distributions.append((gpus[i], BASE_PATTERN, mask))
     
-    solution = None
-    search_round = 1
+    # If we have more GPUs than masks, assign masks again with different start offsets
+    remaining_gpus = gpus[len(masks):]
+    offset_multipliers = [0.25, 0.5, 0.75]  # Different starting points in the search space
     
-    # Create a list of all search strategies with configurable parameters
-    search_strategies = [
-        # GPU searches
-        lambda: gpu_search_with_dual_focus(int(BEST_PHI_MATCH, 16), max_batches=20, bit_mask=0x000FFFFF),
-        lambda: gpu_search_with_dual_focus(int(BEST_ALT_PATTERN, 16), max_batches=20, bit_mask=0x000FFFFF),
+    mask_idx = 0
+    multiplier_idx = 0
+    
+    for gpu in remaining_gpus:
+        # Get next mask and offset multiplier
+        mask = masks[mask_idx]
+        multiplier = offset_multipliers[multiplier_idx]
         
-        # Precise searches (gradually increasing range)
-        lambda: precise_search_around_key(BEST_PHI_MATCH, range_size=100000 * search_round, step_size=1, max_keys=10000000),
-        lambda: precise_search_around_key(BEST_ALT_PATTERN, range_size=100000 * search_round, step_size=1, max_keys=10000000),
+        # Create a modified base pattern with offset
+        # This effectively divides the search space for the same mask
+        base_val = int(BASE_PATTERN, 16)
+        offset_val = int(mask * multiplier) & mask
+        modified_base = base_val | offset_val
+        modified_base_hex = format_private_key(modified_base)
         
-        # Bit manipulations (gradually increasing complexity)
-        lambda: try_multi_bit_manipulations(BEST_PHI_MATCH, max_flips=min(3 + search_round//2, 6), max_positions=min(20 + search_round*4, 40)),
-        lambda: try_multi_bit_manipulations(BEST_ALT_PATTERN, max_flips=min(3 + search_round//2, 6), max_positions=min(20 + search_round*4, 40)),
+        distributions.append((gpu, modified_base_hex, mask))
         
-        # Random bit permutations
-        lambda: random_bit_permutation_search(BEST_PHI_MATCH, iterations=1000000),
-        lambda: random_bit_permutation_search(BEST_ALT_PATTERN, iterations=1000000),
-        
-        # Mathematical transformations
-        lambda: try_mathematical_transformations(BEST_PHI_MATCH),
-        lambda: try_mathematical_transformations(BEST_ALT_PATTERN),
-    ]
+        # Update indices for next assignment
+        multiplier_idx = (multiplier_idx + 1) % len(offset_multipliers)
+        if multiplier_idx == 0:
+            mask_idx = (mask_idx + 1) % len(masks)
     
-    # Optional: Add additional candidate keys from our expanded list
-    for candidate in ADDITIONAL_CANDIDATES:
-        search_strategies.append(lambda key=candidate: gpu_search_with_dual_focus(int(key, 16), max_batches=10, bit_mask=0x000FFFFF))
-        search_strategies.append(lambda key=candidate: precise_search_around_key(key, range_size=50000, step_size=1, max_keys=5000000))
-        search_strategies.append(lambda key=candidate: try_multi_bit_manipulations(key, max_flips=3, max_positions=20))
-    
-    # Search forever until solution is found or interrupted
-    while RUNNING:
-        print(f"\n=== SEARCH ROUND {search_round} ===")
-        print(f"Runtime so far: {format_time(time.time() - START_TIME)}")
-        print(f"Total keys checked: {KEYS_CHECKED:,}")
+    return distributions
 
-        # Run each strategy in turn
-        for i, strategy in enumerate(search_strategies):
-            if not RUNNING:
-                break
-                
-            print(f"\n--- Strategy {i+1}/{len(search_strategies)} in round {search_round} ---")
-            
-            # Run the strategy
-            solution = strategy()
-            
-            # If solution found, exit
-            if solution:
-                print("\nEXIT: Solution found!")
-                return solution
-        
-        # Increment round counter
-        search_round += 1
-        
-        # After each complete round, save progress and report
-        save_progress([], "Completed full search round", 0, force_save=True)
-        
-        # After each complete round, generate a random promising key to add variety
-        # Use the best matches we've found so far as seeds
-        if BEST_GLOBAL_MATCHES:
-            new_seed = BEST_GLOBAL_MATCHES[0][0]  # Use the best match found so far
-            new_candidate = format_private_key(int(new_seed, 16) ^ random.randint(1, 1000))
-            search_strategies.append(lambda key=new_candidate: gpu_search_with_dual_focus(int(key, 16), max_batches=5, bit_mask=0x000FFFFF))
-            print(f"Added new search candidate: {new_candidate}")
+def generate_additional_candidates(base_pattern, num_candidates=10):
+    """Generate additional promising candidate patterns based on the base pattern"""
+    base_int = int(base_pattern, 16)
+    candidates = []
     
-    # If we got here, we were interrupted or solution was found
-    if solution:
-        return solution
-    else:
-        print("\nSearch interrupted. No solution found yet.")
+    # Generate variations with small bit flips
+    for i in range(num_candidates):
+        # Apply different transformations for diversity
+        modified = base_int
+        
+        # Apply a specific transformation based on index
+        if i % 5 == 0:
+            # Flip a low bit
+            modified ^= (1 << (i % 10))
+        elif i % 5 == 1:
+            # XOR with puzzle number shifted
+            modified ^= (PUZZLE_NUMBER << ((i * 2) % 12))
+        elif i % 5 == 2:
+            # Add small value
+            modified += (i * PUZZLE_NUMBER) % 1024
+        elif i % 5 == 3:
+            # Rotate some bits
+            bits_to_rotate = modified & ((1 << 12) - 1)
+            rotated = ((bits_to_rotate << 4) | (bits_to_rotate >> 8)) & ((1 << 12) - 1)
+            modified = (modified & ~((1 << 12) - 1)) | rotated
+        else:
+            # Apply phi-based transformation - phi is special for this puzzle
+            phi_int = int(PHI * 1000) % 256
+            modified ^= (phi_int << (i % 8))
+        
+        # Ensure 68 bits
+        if count_bits(modified) == 68:
+            candidates.append(format_private_key(modified))
+    
+    return candidates
+
+def multi_gpu_search():
+    """Coordinate search across multiple GPUs - optimized for 6x RTX 4090"""
+    global RUNNING, SOLUTION_FOUND
+    
+    # Set up signal handler
+    signal.signal(signal.SIGINT, handle_exit_signal)
+    
+    # Count available GPUs
+    cuda.init()
+    gpu_count = cuda.Device.count()
+    
+    if gpu_count == 0:
+        print("No CUDA devices found!")
         return None
+    
+    print(f"Found {gpu_count} CUDA devices")
+    
+    # Ideally, we have 6 RTX 4090s as specified
+    expected_gpus = 6
+    gpus_to_use = min(gpu_count, expected_gpus)
+    
+    print(f"Using {gpus_to_use} GPUs for search")
+    
+    # Generate search space for each GPU
+    gpu_search_spaces = distribute_masks_to_gpus(
+        list(range(gpus_to_use)), 
+        SEARCH_MASKS
+    )
+    
+    # Add extra candidates for any remaining GPU capacity
+    additional_candidates = generate_additional_candidates(BASE_PATTERN)
+    
+    # Create process pool for GPU workers
+    workers = []
+    
+    # Start a worker for each GPU search space
+    for i, (gpu_id, pattern, mask) in enumerate(gpu_search_spaces):
+        # Estimate batch size based on mask - larger masks need smaller batches
+        batch_size = 50000000 // (bin(mask).count('1') // 4 + 1)
+        
+        # Adjust batch size for RTX 4090s (24GB VRAM)
+        batch_size = min(100000000, max(10000000, batch_size))
+        
+        # Max batches depends on mask size - search longer for smaller spaces
+        max_batches = 2000 // (bin(mask).count('1') // 4 + 1)
+        max_batches = min(10000, max(100, max_batches))
+        
+        # Create worker process
+        worker = mp.Process(
+            target=gpu_search_with_pattern,
+            args=(gpu_id, pattern, mask, batch_size, max_batches)
+        )
+        worker.start()
+        workers.append(worker)
+        
+        # Small stagger to avoid all GPUs competing for CPU at same time
+        time.sleep(1)
+    
+    # Monitor workers and check for results
+    try:
+        running = True
+        while running and not SOLUTION_FOUND:
+            running = False
+            for worker in workers:
+                if worker.is_alive():
+                    running = True
+            
+            # Check if any worker found a solution
+            try:
+                result = RESULT_QUEUE.get(block=False)
+                if result:
+                    print("\nSolution found by a worker:")
+                    print(f"Key: {result[0]}")
+                    SOLUTION_FOUND = True
+                    break
+            except queue.Empty:
+                pass
+            
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user, shutting down workers...")
+        RUNNING = False
+    
+    # Ensure all workers are terminated
+    for worker in workers:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=1)
+    
+    print("\nAll GPU workers completed or terminated")
+    
+    # Report final statistics
+    with GLOBAL_LOCK:
+        end_time = time.time()
+        elapsed = end_time - START_TIME
+        print(f"\nSearch completed in {format_time(elapsed)}")
+        print(f"Total keys checked: {KEYS_CHECKED:,}")
+        print(f"Average speed: {int(KEYS_CHECKED / elapsed):,} keys/second")
+        
+        if BEST_GLOBAL_MATCHES:
+            print("\nBest matches found:")
+            for i, (key, result) in enumerate(BEST_GLOBAL_MATCHES[:3]):
+                print(f"{i+1}. Key: {key}")
+                print(f"   Ratio diff: {result.get('ratio_diff')}")
+                print(f"   Hash: {result.get('generated_hash')}")
+    
+    return None
 
 if __name__ == "__main__":
-    print("Starting exhaustive Bitcoin Puzzle #68 solver")
+    print("Starting Bitcoin Puzzle #68 Solver - Optimized for 6x RTX 4090")
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
     print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
     print(f"Target ratio: φ/8 = {PHI_OVER_8}")
     print(f"Searching for private keys with EXACTLY 68 bits")
-    print(f"Best phi/8 match: {BEST_PHI_MATCH}")
-    print(f"Alternative pattern: {BEST_ALT_PATTERN}")
+    print(f"Base pattern: {BASE_PATTERN}")
     
-    # Check GPU devices
-    print("\nGPU Information:")
-    device = cuda.Device(0)
-    print(f"Using GPU: {device.name()}")
+# Check GPU devices
+print("\nGPU Information:")
+cuda.init()
+device_count = cuda.Device.count()
+print(f"Found {device_count} CUDA devices")
+
+for i in range(device_count):
+    device = cuda.Device(i)
+    props = device.get_attributes()
+    # Use cuda.mem_get_info() instead of device.get_memory_info()
+    cuda.Context(device).push()
     free_mem, total_mem = cuda.mem_get_info()
-    print(f"GPU Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
-    
+    cuda.Context.pop()
+    print(f"GPU {i}: {device.name()}")
+    print(f"  Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
+    print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
+    print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")    
     # Display estimated runtime
-    print("\nRunning exhaustive search. This will continue until a solution is found.")
-    print("Press Ctrl+C to gracefully stop the search.\n")
+    print("\nRunning multi-GPU search optimized for RTX 4090s")
+    print("This will search the specific pattern space very efficiently")
+    print("Press Ctrl+C to gracefully stop the search\n")
     
     # Initialize start time
     START_TIME = time.time()
     
     try:
-        # Run the exhaustive search
-        solution = exhaustive_search()
+        # Run the optimized search
+        solution = multi_gpu_search()
         
         elapsed_time = time.time() - START_TIME
         print(f"\nSearch completed in {format_time(elapsed_time)}")
         
-        if solution:
-            print(f"\nFINAL SOLUTION: {solution}")
-            final_result = verify_private_key(solution)
-            print(f"Hash match: {final_result.get('match')}")
-            print(f"Ratio difference: {float(final_result.get('ratio_diff'))}")
-            print(f"Generated hash: {final_result.get('generated_hash')}")
-            print(f"Target hash: {TARGET_HASH}")
-            print(f"ScriptPubKey: 76a914{TARGET_HASH}88ac")
-            
-            print("\nSaving solution to file...")
-            save_solution(solution, final_result)
-            
-            # Immediately exit when solution is found
-            print("\nSolution found! Exiting program.")
+        if SOLUTION_FOUND:
+            print("\nSolution found! Check puzzle68_SOLVED.txt for details.")
             sys.exit(0)
         else:
-            print("\nNo exact solution found through these strategies.")
+            print("\nNo exact solution found in the target pattern space.")
             print("Check puzzle68_progress.txt for the best matches found so far.")
     
     except KeyboardInterrupt:
@@ -1021,4 +904,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except Exception as e:
         print(f"\nError during search: {str(e)}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
