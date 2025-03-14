@@ -30,8 +30,8 @@ PHI_OVER_8 = 0.202254  # Approximate value of φ/8
 # EXPLICIT DEFINITION of key space boundaries for puzzle 68
 # Search keys where the most significant 24 bits are fixed to 0xcedb18
 FIXED_HIGH_BITS = 0xcedb18
-MIN_KEY = (FIXED_HIGH_BITS << 44)          # 0xcedb18000000000000
-MAX_KEY = MIN_KEY + (1 << 44) - 1          # 0xcedb18FFFFFFFFFFF
+MIN_KEY = (FIXED_HIGH_BITS << 44)          # 0xcedb10000000000000
+MAX_KEY = MIN_KEY + (1 << 44) - 1          # 0xcedb10FFFFFFFFFFF
 
 # CUDA kernel for testing keys
 CUDA_CODE = """
