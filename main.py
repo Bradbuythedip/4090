@@ -27,10 +27,11 @@ TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubK
 PUZZLE_NUMBER = 68
 PHI_OVER_8 = 0.202254  # Approximate value of φ/8
 
-# EXPLICIT DEFINITION of key space boundaries
-FIXED_HIGH_BITS = 0xced
-MIN_KEY = (FIXED_HIGH_BITS << 56)          # 0xced00000000000000
-MAX_KEY = MIN_KEY + (1 << 56) - 1          # 0xcedFFFFFFFFFFFFFFF
+# EXPLICIT DEFINITION of key space boundaries for puzzle 68
+# Search keys where the most significant 24 bits are fixed to 0xcedb18
+FIXED_HIGH_BITS = 0xcedb18
+MIN_KEY = (FIXED_HIGH_BITS << 44)          # 0xcedb18000000000000
+MAX_KEY = MIN_KEY + (1 << 44) - 1          # 0xcedb18FFFFFFFFFFF
 
 # CUDA kernel for testing keys
 CUDA_CODE = """
