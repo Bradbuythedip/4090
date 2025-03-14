@@ -1143,7 +1143,9 @@ def multi_gpu_search():
         print(f"\nError during search: {str(e)}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)if __name__ == "__main__":
+        sys.exit(1)
+
+if __name__ == "__main__":
     try:
         print("Starting Bitcoin Puzzle #68 Solver - Optimized for RTX 4090")
         print(f"Target hash: {TARGET_HASH}")
