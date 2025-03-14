@@ -224,39 +224,51 @@ __global__ void test_keys_with_mutations(uint64_t base_high, uint64_t base_low,
 def setup_gpu(gpu_id):
     """Set up a specific GPU for computation"""
     try:
-        # Note: With pycuda.autoinit, a context is already created for device 0
-        # For other devices, we need to create new contexts carefully
-        device = cuda.Device(gpu_id)
-        
-        # Check if we need to create a new context
+        # Try to initialize CUDA first
         try:
-            # Try to get the current context for this device
-            ctx = device.make_context(flags=cuda.ctx_flags.SCHED_AUTO | cuda.ctx_flags.MAP_HOST)
-            ctx.push()  # Make it active
+            cuda.init()
         except Exception as e:
-            print(f"Warning with GPU {gpu_id} context: {e}")
-            # If we fail, the device might already have a context
+            print(f"Note: CUDA already initialized: {e}")
+        
+        # Get the device
+        try:
+            device = cuda.Device(gpu_id)
+            print(f"Found device {gpu_id}: {device.name()}")
+        except Exception as e:
+            print(f"Error accessing GPU {gpu_id}: {e}")
+            return None
+        
+        # Try to create a context for this device
+        try:
+            context = device.make_context(flags=cuda.ctx_flags.SCHED_AUTO)
+            context.push()
+            print(f"Created context for GPU {gpu_id}")
+        except Exception as e:
+            print(f"Error creating context for GPU {gpu_id}: {e}")
             return None
             
         # Compile module with kernel
-        module = SourceModule(cuda_code)
-        test_keys_kernel = module.get_function("test_keys")
-        test_keys_with_mutations_kernel = module.get_function("test_keys_with_mutations")
+        try:
+            module = SourceModule(cuda_code)
+            test_keys_kernel = module.get_function("test_keys")
+            test_keys_with_mutations_kernel = module.get_function("test_keys_with_mutations")
+        except Exception as e:
+            print(f"Error compiling kernel for GPU {gpu_id}: {e}")
+            context.pop()
+            return None
         
-        print(f"GPU {gpu_id} initialized: {device.name()}")
+        print(f"GPU {gpu_id} fully initialized: {device.name()}")
         
         # Return context in the data so we can properly clean up
         return {
             'device': device,
-            'context': ctx,
+            'context': context,
             'module': module,
             'test_keys': test_keys_kernel,
             'test_keys_with_mutations': test_keys_with_mutations_kernel
         }
     except Exception as e:
-        print(f"Error initializing GPU {gpu_id}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Unexpected error initializing GPU {gpu_id}: {e}")
         return None
 
 def release_gpu(gpu_data):
@@ -790,30 +802,50 @@ def multi_gpu_search(num_gpus=4):  # Default to 4 GPUs
     # Set up signal handler
     signal.signal(signal.SIGINT, handle_exit_signal)
     
-    # Count available GPUs
-    available_gpus = min(cuda.Device.count(), num_gpus)
-    print(f"Found {cuda.Device.count()} CUDA devices, will use {available_gpus}")
+    # Double check how many GPUs are really available
+    try:
+        cuda.init()  # Ensure CUDA is initialized
+        device_count = cuda.Device.count()
+        print(f"CUDA reports {device_count} available devices")
+        available_gpus = min(device_count, num_gpus)
+        if available_gpus < num_gpus:
+            print(f"Warning: Requested {num_gpus} GPUs but only {available_gpus} are available")
+        if available_gpus == 0:
+            print("Error: No CUDA devices available!")
+            return None
+    except Exception as e:
+        print(f"Error detecting GPUs: {e}")
+        available_gpus = 1  # Default to 1 if we can't detect
     
-    # Check for RTX 4090s without creating new contexts
+    print(f"Will use {available_gpus} GPUs for search")
+    
+    # Verify which GPUs are actually working
+    working_gpus = []
     for i in range(available_gpus):
-        device = cuda.Device(i)
-        props = device.get_attributes()
-        # Don't check memory info here to avoid context issues
-        print(f"GPU {i}: {device.name()}")
-        
-        # If we detect RTX 4090, we can use larger batch sizes
-        if "4090" in device.name():
-            print(f"  Detected RTX 4090, will use optimized parameters")
+        try:
+            device = cuda.Device(i)
+            props = device.get_attributes()
+            print(f"GPU {i}: {device.name()} - {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]} SMs")
+            working_gpus.append(i)
+        except Exception as e:
+            print(f"Warning: GPU {i} could not be accessed: {e}")
     
-    # Set up search spaces for all GPUs
-    search_spaces = setup_search_spaces_for_gpus(available_gpus)
+    if not working_gpus:
+        print("Error: No working GPUs found!")
+        return None
+    
+    print(f"Found {len(working_gpus)} working GPUs: {working_gpus}")
+    
+    # Set up search spaces only for working GPUs
+    search_spaces = setup_search_spaces_for_gpus(len(working_gpus))
     
     # Create workers
     workers = []
     
     # Create a worker for each GPU
-    for space in search_spaces:
-        gpu_id = space['gpu_id']
+    for i, space in enumerate(search_spaces):
+        # Use the actual GPU ID from our working_gpus list
+        gpu_id = working_gpus[i]
         base_pattern = space['base_pattern']
         bit_mask = space['bit_mask']
         
@@ -823,23 +855,32 @@ def multi_gpu_search(num_gpus=4):  # Default to 4 GPUs
         max_batches = 500
         
         # For certain GPU models, increase batch size 
-        if "4090" in cuda.Device(gpu_id).name():
-            batch_size = 100000000  # 100M keys for RTX 4090
-            max_batches = 1000
+        try:
+            gpu_name = cuda.Device(gpu_id).name()
+            if "4090" in gpu_name:
+                batch_size = 100000000  # 100M keys for RTX 4090
+                max_batches = 1000
+                print(f"GPU {gpu_id}: Using optimized parameters for RTX 4090")
+        except Exception as e:
+            print(f"Warning: Couldn't get name for GPU {gpu_id}: {e}")
             
         print(f"GPU {gpu_id}: Assigned search space starting with {base_pattern}")
         print(f"GPU {gpu_id}: Using batch size: {batch_size:,}, max batches: {max_batches}")
         
         # Create and start worker
-        worker = mp.Process(
-            target=gpu_search_with_pattern,
-            args=(gpu_id, base_pattern, bit_mask, batch_size, max_batches)
-        )
-        worker.start()
-        workers.append(worker)
-        
-        # Small delay to stagger startup
-        time.sleep(1)
+        try:
+            worker = mp.Process(
+                target=gpu_search_with_pattern,
+                args=(gpu_id, base_pattern, bit_mask, batch_size, max_batches)
+            )
+            worker.start()
+            workers.append(worker)
+            
+            # Small delay to stagger startup
+            time.sleep(2)  # Longer delay to prevent initialization conflicts
+        except Exception as e:
+            print(f"Error creating worker for GPU {gpu_id}: {e}")
+            # Continue with other GPUs
     
     # Monitor workers
     try:
