@@ -1,5 +1,5 @@
-# simple_cuda_search.py
-# A minimal, focused PyCUDA implementation for Bitcoin Puzzle #68
+# multi_pattern_cuda_search.py
+# Searches multiple pattern spaces exhaustively for Bitcoin Puzzle #68
 
 import hashlib
 import binascii
@@ -9,6 +9,8 @@ import numpy as np
 from mpmath import mp, mpf, fabs
 import ecdsa
 from ecdsa import SECP256k1, SigningKey
+import argparse
+import os
 
 # Import PyCUDA modules with proper error handling
 try:
@@ -31,10 +33,27 @@ TARGET_HASH = 'e0b8a2baee1b77fc703455f39d51477451fc8cfc'  # Hash from scriptPubK
 PUZZLE_NUMBER = 68
 PHI_OVER_8 = float(PHI / 8)  # Convert to float for GPU compatibility
 
-# Pattern to search
-PATTERN_BASE = "00000000000000000000000000000000000000000000000cedb187f"
+# Pattern spaces to search
+PATTERNS = [
+    # Primary search pattern - already searched
+    {"pattern": "00000000000000000000000000000000000000000000000cedb187f", "comment": "CEDB187F pattern", "searched": True},
+    
+    # Key patterns with close phi/8 ratios
+    {"pattern": "00000000000000000000000000000000000000000000000041a01b90", "comment": "PHI_MATCH base", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000cedb187e", "comment": "CEDB187E (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000cedb187d", "comment": "CEDB187D (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000cedb1870", "comment": "CEDB1870 (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000cedb186f", "comment": "CEDB186F (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000cedb087f", "comment": "CEDB087F (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000cedb387f", "comment": "CEDB387F (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000ced3187f", "comment": "CED3187F (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000ceda187f", "comment": "CEDA187F (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000c6db187f", "comment": "C6DB187F (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000dedb187f", "comment": "DEDB187F (1 bit difference)", "searched": False},
+    {"pattern": "00000000000000000000000000000000000000000000000467a98b1", "comment": "Additional candidate pattern", "searched": False}
+]
 
-# Simple CUDA kernel for testing keys
+# CUDA kernel for testing keys
 CUDA_CODE = """
 #include <stdio.h>
 #include <stdint.h>
@@ -223,8 +242,8 @@ def format_time(seconds):
         minutes = int((seconds % 3600) / 60)
         return f"{hours} hours, {minutes} minutes"
 
-def single_gpu_search():
-    """Run search on a single GPU with proper initialization and error handling"""
+def search_pattern(pattern_base, suffix_digits=8, batch_size=50000000, device_id=0):
+    """Search a specific pattern space using GPU acceleration"""
     if not HAS_CUDA:
         print("CUDA not available. Cannot run GPU search.")
         return None
@@ -243,17 +262,20 @@ def single_gpu_search():
         if device_count == 0:
             print("No CUDA devices found")
             return None
+        if device_id >= device_count:
+            print(f"Device {device_id} not available. Using device 0 instead.")
+            device_id = 0
         print(f"Found {device_count} CUDA device(s)")
     except Exception as e:
         print(f"Error getting device count: {e}")
         return None
     
-    # Select first device (device 0)
+    # Select device
     try:
-        device = cuda.Device(0)
-        print(f"Using device 0: {device.name()}")
+        device = cuda.Device(device_id)
+        print(f"Using device {device_id}: {device.name()}")
     except Exception as e:
-        print(f"Error selecting device 0: {e}")
+        print(f"Error selecting device {device_id}: {e}")
         return None
     
     # Create context
@@ -265,14 +287,13 @@ def single_gpu_search():
         return None
     
     try:
-        # Try to check memory info (this often fails if there are problems)
+        # Try to check memory info
         try:
             free_mem, total_mem = cuda.mem_get_info()
             print(f"GPU memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
-            batch_size = min(50000000, int(free_mem * 0.7 / 16))  # 16 bytes per key
+            batch_size = min(batch_size, int(free_mem * 0.7 / 16))  # 16 bytes per key
         except Exception as e:
             print(f"Warning: Could not get memory info: {e}")
-            batch_size = 10000000  # Use conservative default batch size
         
         print(f"Using batch size: {batch_size:,}")
         
@@ -287,10 +308,13 @@ def single_gpu_search():
             return None
         
         # Prepare base pattern
-        base_int = int(PATTERN_BASE, 16)
+        base_int = int(pattern_base, 16)
         base_high = base_int >> 32
         base_low = base_int & 0xFFFFFFFF
-        bit_mask = 0xFFFFFFFF  # Mask for full pattern suffix
+        
+        # Calculate bit mask for suffix digits
+        suffix_bits = suffix_digits * 4
+        bit_mask = (1 << suffix_bits) - 1
         
         # Clear the bits we want to explore in base_low
         base_low_masked = base_low & ~bit_mask
@@ -310,19 +334,39 @@ def single_gpu_search():
         ratios_gpu = cuda.mem_alloc(ratios.nbytes)
         
         # Determine number of batches
-        max_suffix = 0xFFFFFFFF  # Maximum suffix value (covers all 10 hex digits)
+        max_suffix = (1 << suffix_bits) - 1
         total_batches = (max_suffix // batch_size) + 1
         
-        print(f"Starting search of pattern {PATTERN_BASE}xxxxxxxxxx")
+        print(f"Starting search of pattern {pattern_base + 'x'*suffix_digits}")
+        print(f"Suffix space size: {max_suffix+1:,} ({suffix_digits} hex digits)")
         print(f"Estimated batches: {total_batches}")
         
+        # Create/update progress tracking file for this pattern
+        pattern_progress_file = f"pattern_{pattern_base}_progress.txt"
+        if os.path.exists(pattern_progress_file):
+            try:
+                with open(pattern_progress_file, 'r') as f:
+                    last_batch = int(f.readline().strip())
+                    print(f"Resuming from batch {last_batch+1}/{total_batches}")
+                    start_batch = last_batch + 1
+            except:
+                print("Could not read progress file, starting from batch 0")
+                start_batch = 0
+        else:
+            start_batch = 0
+        
+        # Save initial progress
+        with open(pattern_progress_file, 'w') as f:
+            f.write(str(start_batch - 1) + "\n")
+        
         start_time = time.time()
-        total_keys_checked = 0
+        total_keys_checked = start_batch * batch_size
         best_matches = []
         
+        # Main search loop
         try:
             # Process batches
-            for batch in range(total_batches):
+            for batch in range(start_batch, total_batches):
                 batch_start_time = time.time()
                 
                 # Start with a fresh offset range for this batch
@@ -368,6 +412,10 @@ def single_gpu_search():
                 total_keys_checked += current_batch_size
                 batch_time = time.time() - batch_start_time
                 elapsed_time = time.time() - start_time
+                
+                # Save batch progress
+                with open(pattern_progress_file, 'w') as f:
+                    f.write(str(batch) + "\n")
                 
                 print(f"\nBatch {batch+1}/{total_batches} completed in {format_time(batch_time)}")
                 print(f"Total keys checked: {total_keys_checked:,}")
@@ -444,25 +492,26 @@ def single_gpu_search():
                         print(f"   Ratio diff: {diff}")
                         print(f"   Hash: {hash_val}")
                 
-                # Save intermediate results
-                with open("puzzle68_progress.txt", "w") as f:
-                    f.write(f"Search progress as of {time.ctime()}\n")
-                    f.write(f"Pattern: {PATTERN_BASE}xxxxxxxxxx\n")
+                # Save overall progress for all patterns
+                with open("puzzle68_multi_pattern_progress.txt", "a") as f:
+                    f.write(f"Pattern {pattern_base + 'x'*suffix_digits} - {time.ctime()}\n")
                     f.write(f"Batch: {batch+1}/{total_batches}\n")
                     f.write(f"Keys checked: {total_keys_checked:,}\n")
-                    f.write(f"Keys/sec: {int(current_batch_size / batch_time):,}\n")
-                    f.write(f"Elapsed time: {format_time(elapsed_time)}\n")
-                    f.write(f"Estimated time remaining: {format_time(estimated_time)}\n\n")
-                    
-                    if best_matches:
-                        f.write("Best matches so far:\n")
-                        for i, (key, diff, hash_val) in enumerate(best_matches):
-                            f.write(f"{i+1}. Key: {key}\n")
-                            f.write(f"   Ratio diff: {diff}\n")
-                            f.write(f"   Hash: {hash_val}\n\n")
+                    f.write(f"Progress: {total_keys_checked/(max_suffix+1)*100:.2f}%\n\n")
+            
+            print(f"\nCompleted search of pattern {pattern_base + 'x'*suffix_digits}")
+            print(f"Total keys checked: {total_keys_checked:,}")
+            
+            # Mark this pattern as searched
+            with open("patterns_searched.txt", "a") as f:
+                f.write(f"{pattern_base}\n")
         
         except KeyboardInterrupt:
             print("\nSearch interrupted by user")
+            # Save the last completed batch for resuming later
+            with open(pattern_progress_file, 'w') as f:
+                f.write(str(batch) + "\n")
+        
         except Exception as e:
             print(f"\nError during search: {e}")
             import traceback
@@ -493,14 +542,43 @@ def single_gpu_search():
     return None
 
 def main():
-    """Main function"""
-    print("Simple PyCUDA Bitcoin Puzzle Searcher")
+    """Main function with command line argument parsing"""
+    parser = argparse.ArgumentParser(description="Multi-Pattern Bitcoin Puzzle Searcher")
+    parser.add_argument("--pattern", type=str, help="Specific pattern to search (hex prefix)")
+    parser.add_argument("--suffix-digits", type=int, default=8, help="Number of suffix hex digits to search (default: 8)")
+    parser.add_argument("--device", type=int, default=0, help="CUDA device ID to use (default: 0)")
+    parser.add_argument("--batch-size", type=int, default=50000000, help="Batch size (default: 50M)")
+    parser.add_argument("--list", action="store_true", help="List available patterns and exit")
+    parser.add_argument("--all", action="store_true", help="Search all patterns sequentially")
+    args = parser.parse_args()
+    
+    print("Multi-Pattern Bitcoin Puzzle Searcher")
     print(f"Target hash: {TARGET_HASH}")
     print(f"Target scriptPubKey: 76a914{TARGET_HASH}88ac")
     print(f"Target Bitcoin address: 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ")
     print(f"Target ratio: φ/8 = {PHI_OVER_8}")
     print(f"Searching for private keys with EXACTLY 68 bits")
-    print(f"Pattern: {PATTERN_BASE}xxxxxxxxxx")
+    
+    # Load list of patterns already searched
+    searched_patterns = set()
+    if os.path.exists("patterns_searched.txt"):
+        with open("patterns_searched.txt", "r") as f:
+            for line in f:
+                pattern = line.strip()
+                if pattern:
+                    searched_patterns.add(pattern)
+    
+    # Update the patterns list with the patterns we've already searched
+    for i in range(len(PATTERNS)):
+        PATTERNS[i]["searched"] = PATTERNS[i]["pattern"] in searched_patterns
+    
+    # If --list specified, just list the patterns and exit
+    if args.list:
+        print("\nAvailable patterns to search:")
+        for i, pattern_info in enumerate(PATTERNS):
+            status = "SEARCHED" if pattern_info["searched"] else "NOT SEARCHED"
+            print(f"{i+1}. {pattern_info['pattern']} - {pattern_info['comment']} - {status}")
+        return
     
     # Check whether we can use CUDA
     if not HAS_CUDA:
@@ -508,15 +586,60 @@ def main():
         return
     
     try:
-        # Run the single GPU search
-        print("\nStarting GPU search...")
-        solution = single_gpu_search()
+        if args.pattern:
+            # Search a specific pattern
+            print(f"\nSearching specific pattern: {args.pattern}")
+            solution = search_pattern(
+                args.pattern, 
+                suffix_digits=args.suffix_digits,
+                batch_size=args.batch_size,
+                device_id=args.device
+            )
+            
+            if solution:
+                print(f"\nFinal solution: {solution}")
+            else:
+                print("\nNo solution found or search was interrupted.")
         
-        if solution:
-            print(f"\nFinal solution: {solution}")
+        elif args.all:
+            # Search all patterns that haven't been searched yet
+            for pattern_info in PATTERNS:
+                if not pattern_info["searched"]:
+                    print(f"\nSearching pattern: {pattern_info['pattern']} - {pattern_info['comment']}")
+                    solution = search_pattern(
+                        pattern_info["pattern"],
+                        suffix_digits=args.suffix_digits,
+                        batch_size=args.batch_size,
+                        device_id=args.device
+                    )
+                    
+                    if solution:
+                        print(f"\nFinal solution: {solution}")
+                        return
+                    
+                    print("\nMoving to next pattern...")
+            
+            print("\nAll patterns searched without finding a solution.")
+        
         else:
-            print("\nNo solution found or search was interrupted.")
-            print("Check puzzle68_progress.txt for partial results.")
+            # Pick the first unsearched pattern
+            unsearched_patterns = [p for p in PATTERNS if not p["searched"]]
+            if unsearched_patterns:
+                pattern_info = unsearched_patterns[0]
+                print(f"\nSearching next unsearched pattern: {pattern_info['pattern']} - {pattern_info['comment']}")
+                solution = search_pattern(
+                    pattern_info["pattern"],
+                    suffix_digits=args.suffix_digits,
+                    batch_size=args.batch_size,
+                    device_id=args.device
+                )
+                
+                if solution:
+                    print(f"\nFinal solution: {solution}")
+                else:
+                    print("\nNo solution found or search was interrupted.")
+            else:
+                print("\nAll patterns have been searched. Use --pattern to specify a custom pattern.")
     
     except KeyboardInterrupt:
         print("\nSearch interrupted by user.")
