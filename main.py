@@ -857,23 +857,26 @@ if __name__ == "__main__":
     print(f"Searching for private keys with EXACTLY 68 bits")
     print(f"Base pattern: {BASE_PATTERN}")
     
-# Check GPU devices
-print("\nGPU Information:")
-cuda.init()
-device_count = cuda.Device.count()
-print(f"Found {device_count} CUDA devices")
+    # Check GPU devices
+    print("\nGPU Information:")
+    cuda.init()
+    device_count = cuda.Device.count()
+    print(f"Found {device_count} CUDA devices")
 
-for i in range(device_count):
-    device = cuda.Device(i)
-    props = device.get_attributes()
-    # Use cuda.mem_get_info() instead of device.get_memory_info()
-    cuda.Context(device).push()
-    free_mem, total_mem = cuda.mem_get_info()
-    cuda.Context.pop()
-    print(f"GPU {i}: {device.name()}")
-    print(f"  Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
-    print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
-    print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")    
+    for i in range(device_count):
+        device = cuda.Device(i)
+        props = device.get_attributes()
+        
+        # Create context properly for getting memory info
+        ctx = device.make_context()
+        free_mem, total_mem = cuda.mem_get_info()
+        ctx.pop()
+        
+        print(f"GPU {i}: {device.name()}")
+        print(f"  Memory: {free_mem/(1024**3):.2f} GB free / {total_mem/(1024**3):.2f} GB total")
+        print(f"  Compute Capability: {props[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]}.{props[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]}")
+        print(f"  Multiprocessors: {props[cuda.device_attribute.MULTIPROCESSOR_COUNT]}")
+    
     # Display estimated runtime
     print("\nRunning multi-GPU search optimized for RTX 4090s")
     print("This will search the specific pattern space very efficiently")
